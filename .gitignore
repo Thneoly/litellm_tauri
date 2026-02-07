@@ -1,0 +1,35 @@
+# Node / Vite
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.tsbuildinfo
+.cache/
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/bin/litellm_server*
+src-tauri/tauri.windows.conf.json
+
+# Python (sidecar build)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Env / logs
+.env
+.env.*
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

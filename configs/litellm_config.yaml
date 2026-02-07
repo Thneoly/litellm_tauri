@@ -1,0 +1,13 @@
+# config.yaml
+model_list:
+  - model_name: qwen-local  # 业务层看到的模型名
+    litellm_params:
+      model: openai/Qwen/Qwen2.5-7B-Instruct-AWQ  # 必须加 openai/ 前缀
+      api_base: http://localhost:8000/v1         # 指向你的 vLLM 地址
+      api_key: os.environ/ANTHROPIC_API_KEY      # vLLM 默认不需要 Key
+
+router_settings:
+  model_group_alias: {"gemini-2.5-pro": "qwen-local"}
+
+general_settings:
+  master_key: sk-1234  # 你的 LiteLLM 管理员 Key

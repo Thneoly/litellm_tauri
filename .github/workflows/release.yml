@@ -1,0 +1,127 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      BUILD_DIR: .cache/litellm_build_py313
+      NUITKA_CACHE_DIR: .cache/nuitka_cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: |
+            scripts/build_litellm_server.sh
+            scripts/build_litellm_server.ps1
+
+      - name: Cache LiteLLM sidecar build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/nuitka_cache
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('scripts/build_litellm_server.sh', 'scripts/build_litellm_server.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-
+
+      - name: Configure Windows code signing
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            Write-Host "Windows signing secrets not provided; skipping."
+            exit 0
+          }
+
+          $certPath = Join-Path $env:RUNNER_TEMP "windows_cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $certPath -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+
+          if (-not $env:WINDOWS_CERTIFICATE_THUMBPRINT -or -not $env:WINDOWS_TIMESTAMP_URL) {
+            Write-Host "Signing secrets not fully provided; skipping tauri.windows.conf.json generation."
+            exit 0
+          }
+
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $env:WINDOWS_CERTIFICATE_THUMBPRINT
+                digestAlgorithm = "sha256"
+                timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+          $config | Set-Content -Path "src-tauri\\tauri.windows.conf.json" -Encoding ASCII
+
+      - name: Build LiteLLM sidecar (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: bash scripts/build_litellm_server.sh
+
+      - name: Build LiteLLM sidecar (Windows)
+        if: matrix.os == 'windows-latest'
+        run: pwsh scripts/build_litellm_server.ps1
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'LiteLLM Desktop v__VERSION__'
+          releaseBody: 'See the assets to download this version and install.'
+          releaseDraft: true
+          prerelease: false
