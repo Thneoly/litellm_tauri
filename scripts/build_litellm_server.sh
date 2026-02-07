@@ -8,6 +8,8 @@ NUITKA_CACHE_DIR="${NUITKA_CACHE_DIR:-$BUILD_DIR/nuitka_cache}"
 OUT_DIR="${OUT_DIR:-$BUILD_DIR/out}"
 LITELLM_VERSION="${LITELLM_VERSION:-1.81.6}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.13}"
+CCACHE_DIR="${CCACHE_DIR:-$ROOT_DIR/.cache/ccache}"
+CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
 
 mkdir -p "$BUILD_DIR" "$NUITKA_CACHE_DIR" "$OUT_DIR"
 mkdir -p "$ROOT_DIR/src-tauri/bin"
@@ -31,6 +33,14 @@ else
   PYTHON_BIN="$VENV_DIR/bin/python"
   "$PYTHON_BIN" -m pip install --upgrade pip
   "$PYTHON_BIN" -m pip install "litellm[proxy]==${LITELLM_VERSION}" nuitka zstandard
+fi
+
+if command -v ccache >/dev/null 2>&1; then
+  mkdir -p "$CCACHE_DIR"
+  export CCACHE_DIR
+  export CCACHE_MAXSIZE
+  export CC="ccache gcc"
+  export CXX="ccache g++"
 fi
 
 cat > "$BUILD_DIR/litellm_server.py" <<'PY'

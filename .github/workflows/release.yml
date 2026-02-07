@@ -20,6 +20,8 @@ jobs:
     env:
       BUILD_DIR: .cache/litellm_build_py313
       NUITKA_CACHE_DIR: .cache/nuitka_cache
+      CCACHE_DIR: .cache/ccache
+      CCACHE_MAXSIZE: 2G
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +51,7 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ccache
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -68,6 +70,16 @@ jobs:
           key: ${{ runner.os }}-nuitka-${{ hashFiles('scripts/build_litellm_server.sh', 'scripts/build_litellm_server.ps1') }}
           restore-keys: |
             ${{ runner.os }}-nuitka-
+
+      - name: Cache ccache
+        if: matrix.os == 'ubuntu-22.04'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('scripts/build_litellm_server.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
 
       - name: Configure Windows code signing
         if: matrix.os == 'windows-latest'
