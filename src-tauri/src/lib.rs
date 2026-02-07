@@ -61,6 +61,31 @@ struct HealthStatus {
     error: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct EnvEntry {
+    key: String,
+    value: String,
+    #[serde(default = "default_env_enabled")]
+    enabled: bool,
+}
+
+fn default_env_enabled() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct RuntimePaths {
+    app_config_dir: String,
+    auth_file: String,
+    config_file: String,
+    env_file: String,
+    log_dir: String,
+    log_file: String,
+    resource_dir: Option<String>,
+    executable_dir: Option<String>,
+    sidecar_path: Option<String>,
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -93,6 +118,10 @@ fn config_file_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir.join("config.yaml"))
 }
 
+fn env_file_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_config_dir(app)?.join("env.json"))
+}
+
 fn read_auth_file(app: &AppHandle) -> Result<AuthFile> {
     let path = auth_file_path(app)?;
     let raw = fs::read_to_string(&path).context("read auth file")?;
@@ -105,6 +134,51 @@ fn write_auth_file(app: &AppHandle, auth: &AuthFile) -> Result<()> {
     let raw = serde_json::to_string_pretty(auth).context("serialize auth file")?;
     fs::write(&path, raw).context("write auth file")?;
     Ok(())
+}
+
+fn normalize_env_entries(entries: Vec<EnvEntry>) -> Result<Vec<EnvEntry>> {
+    let mut normalized = Vec::new();
+    for entry in entries {
+        let key = entry.key.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        if key.contains('=') || key.contains(char::is_whitespace) {
+            return Err(anyhow!("invalid env key: {key}"));
+        }
+        normalized.push(EnvEntry {
+            key,
+            value: entry.value,
+            enabled: entry.enabled,
+        });
+    }
+    Ok(normalized)
+}
+
+fn read_env_entries(app: &AppHandle) -> Result<Vec<EnvEntry>> {
+    let path = env_file_path(app)?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let raw = fs::read_to_string(&path).context("read env file")?;
+    let entries = serde_json::from_str(&raw).context("parse env file")?;
+    Ok(entries)
+}
+
+fn write_env_entries(app: &AppHandle, entries: Vec<EnvEntry>) -> Result<()> {
+    let normalized = normalize_env_entries(entries)?;
+    let path = env_file_path(app)?;
+    let raw = serde_json::to_string_pretty(&normalized).context("serialize env file")?;
+    fs::write(&path, raw).context("write env file")?;
+    Ok(())
+}
+
+fn apply_env_entries(cmd: &mut Command, entries: &[EnvEntry]) {
+    for entry in entries {
+        if entry.enabled {
+            cmd.env(&entry.key, &entry.value);
+        }
+    }
 }
 
 fn hash_password(salt: &[u8], password: &str) -> String {
@@ -299,6 +373,17 @@ fn save_config(app: AppHandle, content: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn load_env(app: AppHandle) -> Result<Vec<EnvEntry>, String> {
+    read_env_entries(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_env(app: AppHandle, entries: Vec<EnvEntry>) -> Result<bool, String> {
+    write_env_entries(&app, entries).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
 fn start_litellm(
     app: AppHandle,
     state: tauri::State<AppState>,
@@ -326,6 +411,7 @@ fn start_litellm(
     let log_path = log_dir.join("litellm.log");
 
     let sidecar = find_sidecar(&app).map_err(|e| e.to_string())?;
+    let env_entries = read_env_entries(&app).map_err(|e| e.to_string())?;
 
     let (stdout, stderr) = open_log_file(&log_path).map_err(|e| e.to_string())?;
 
@@ -334,6 +420,7 @@ fn start_litellm(
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
     let mut cmd = Command::new(&sidecar);
+    apply_env_entries(&mut cmd, &env_entries);
     cmd.env("LITELLM_CONFIG_PATH", &config_path);
     if let Some(port) = port {
         cmd.env("LITELLM_PORT", port.to_string());
@@ -470,6 +557,42 @@ fn read_logs(app: AppHandle, max_lines: Option<usize>) -> Result<Vec<String>, St
     Ok(lines[lines.len() - limit..].to_vec())
 }
 
+#[tauri::command]
+fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
+    let config_dir = app_config_dir(&app).map_err(|e| e.to_string())?;
+    let auth_file = auth_file_path(&app).map_err(|e| e.to_string())?;
+    let config_file = config_file_path(&app).map_err(|e| e.to_string())?;
+    let env_file = env_file_path(&app).map_err(|e| e.to_string())?;
+    let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
+    let log_file = log_dir.join("litellm.log");
+
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    let executable_dir = app
+        .path()
+        .executable_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    let sidecar_path = find_sidecar(&app)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+
+    Ok(RuntimePaths {
+        app_config_dir: config_dir.to_string_lossy().to_string(),
+        auth_file: auth_file.to_string_lossy().to_string(),
+        config_file: config_file.to_string_lossy().to_string(),
+        env_file: env_file.to_string_lossy().to_string(),
+        log_dir: log_dir.to_string_lossy().to_string(),
+        log_file: log_file.to_string_lossy().to_string(),
+        resource_dir,
+        executable_dir,
+        sidecar_path,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -481,11 +604,14 @@ pub fn run() {
             auth_login,
             load_config,
             save_config,
+            load_env,
+            save_env,
             start_litellm,
             stop_litellm,
             litellm_status,
             litellm_health,
-            read_logs
+            read_logs,
+            runtime_paths
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

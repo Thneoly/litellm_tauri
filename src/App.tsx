@@ -23,7 +23,25 @@ type HealthStatus = {
   error?: string | null;
 };
 
-type TabKey = "config" | "status";
+type RuntimePaths = {
+  app_config_dir: string;
+  auth_file: string;
+  config_file: string;
+  env_file: string;
+  log_dir: string;
+  log_file: string;
+  resource_dir?: string | null;
+  executable_dir?: string | null;
+  sidecar_path?: string | null;
+};
+
+type EnvEntry = {
+  key: string;
+  value: string;
+  enabled: boolean;
+};
+
+type TabKey = "config" | "status" | "env";
 
 const sampleConfig = `# LiteLLM config example (YAML)
 # https://docs.litellm.ai/docs/proxy/configs
@@ -64,6 +82,8 @@ function App() {
   const [port, setPort] = useState("4000");
   const [host, setHost] = useState("127.0.0.1");
   const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [runtimePaths, setRuntimePaths] = useState<RuntimePaths | null>(null);
+  const [envEntries, setEnvEntries] = useState<EnvEntry[]>([]);
 
   const hasAccount = authStatus?.has_account ?? false;
   const showRegister = authStatus && !hasAccount;
@@ -102,6 +122,15 @@ function App() {
     setConfigText(content ?? "");
   }
 
+  async function loadEnv() {
+    const entries = await invoke<EnvEntry[]>("load_env");
+    if (entries.length === 0) {
+      setEnvEntries([{ key: "", value: "", enabled: true }]);
+    } else {
+      setEnvEntries(entries);
+    }
+  }
+
   useEffect(() => {
     refreshAuth().catch((err) => setError(String(err)));
   }, []);
@@ -109,6 +138,7 @@ function App() {
   useEffect(() => {
     if (!loggedIn) return;
     loadConfig().catch((err) => setError(String(err)));
+    loadEnv().catch((err) => setError(String(err)));
     refreshStatus().catch((err) => setError(String(err)));
     refreshHealth().catch(() => undefined);
     const timer = window.setInterval(() => {
@@ -167,6 +197,17 @@ function App() {
     }
   }
 
+  async function handleSaveEnv() {
+    setError("");
+    setMessage("");
+    try {
+      await invoke("save_env", { entries: envEntries });
+      setMessage("环境变量已保存");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   async function handleStart() {
     setError("");
     setMessage("");
@@ -197,6 +238,61 @@ function App() {
     }
   }
 
+  async function handleShowPaths() {
+    setError("");
+    setMessage("");
+    try {
+      const data = await invoke<RuntimePaths>("runtime_paths");
+      setRuntimePaths(data);
+      setMessage("已获取本机路径");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  function updateEnvEntry(index: number, patch: Partial<EnvEntry>) {
+    setEnvEntries((prev) => {
+      const next = [...prev];
+      next[index] = { ...next[index], ...patch };
+      return next;
+    });
+  }
+
+  function addEnvEntry() {
+    setEnvEntries((prev) => [...prev, { key: "", value: "", enabled: true }]);
+  }
+
+  function removeEnvEntry(index: number) {
+    setEnvEntries((prev) => prev.filter((_, idx) => idx !== index));
+  }
+
+  function escapeDoubleQuotes(value: string) {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  const envPreview = useMemo(() => {
+    const rows = envEntries.filter((entry) => entry.key.trim().length > 0);
+    const linux = rows
+      .map((entry) => {
+        const prefix = entry.enabled ? "" : "# ";
+        return `${prefix}export ${entry.key}="${escapeDoubleQuotes(entry.value)}"`;
+      })
+      .join("\n");
+    const powershell = rows
+      .map((entry) => {
+        const prefix = entry.enabled ? "" : "# ";
+        return `${prefix}$env:${entry.key}="${escapeDoubleQuotes(entry.value)}"`;
+      })
+      .join("\n");
+    const cmd = rows
+      .map((entry) => {
+        const prefix = entry.enabled ? "" : "REM ";
+        return `${prefix}set "${entry.key}=${entry.value}"`;
+      })
+      .join("\n");
+    return { linux, powershell, cmd };
+  }, [envEntries]);
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -214,6 +310,12 @@ function App() {
               onClick={() => setTab("config")}
             >
               配置
+            </button>
+            <button
+              className={tab === "env" ? "tab active" : "tab"}
+              onClick={() => setTab("env")}
+            >
+              环境变量
             </button>
             <button
               className={tab === "status" ? "tab active" : "tab"}
@@ -322,6 +424,137 @@ function App() {
                 启动 LiteLLM
               </button>
             </div>
+            <div className="button-row">
+              <button className="ghost" onClick={handleShowPaths}>
+                显示本机路径
+              </button>
+            </div>
+            {runtimePaths && (
+              <div className="path-panel">
+                <div className="path-row">
+                  <div className="label">配置目录</div>
+                  <div className="path-value">{runtimePaths.app_config_dir}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">账号文件</div>
+                  <div className="path-value">{runtimePaths.auth_file}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">配置文件</div>
+                  <div className="path-value">{runtimePaths.config_file}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">环境变量文件</div>
+                  <div className="path-value">{runtimePaths.env_file}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">日志目录</div>
+                  <div className="path-value">{runtimePaths.log_dir}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">日志文件</div>
+                  <div className="path-value">{runtimePaths.log_file}</div>
+                </div>
+                {runtimePaths.sidecar_path && (
+                  <div className="path-row">
+                    <div className="label">Sidecar</div>
+                    <div className="path-value">{runtimePaths.sidecar_path}</div>
+                  </div>
+                )}
+                {runtimePaths.resource_dir && (
+                  <div className="path-row">
+                    <div className="label">资源目录</div>
+                    <div className="path-value">{runtimePaths.resource_dir}</div>
+                  </div>
+                )}
+                {runtimePaths.executable_dir && (
+                  <div className="path-row">
+                    <div className="label">可执行目录</div>
+                    <div className="path-value">{runtimePaths.executable_dir}</div>
+                  </div>
+                )}
+              </div>
+            )}
+            {error && <div className="alert error">{error}</div>}
+            {message && <div className="alert success">{message}</div>}
+          </section>
+        )}
+
+        {loggedIn && tab === "env" && (
+          <section className="card env-card">
+            <h2>环境变量</h2>
+            <p className="muted">
+              仅影响本应用启动的 LiteLLM sidecar。保存后再次启动服务生效。
+            </p>
+            <div className="env-table">
+              <div className="env-header">
+                <span>启用</span>
+                <span>键名</span>
+                <span>值</span>
+                <span>操作</span>
+              </div>
+              {envEntries.map((entry, index) => (
+                <div className="env-row" key={`env-${index}`}>
+                  <input
+                    type="checkbox"
+                    className="env-toggle"
+                    checked={entry.enabled}
+                    onChange={(e) => updateEnvEntry(index, { enabled: e.target.checked })}
+                  />
+                  <input
+                    className="env-key"
+                    value={entry.key}
+                    onChange={(e) => updateEnvEntry(index, { key: e.target.value })}
+                    placeholder="OPENAI_API_KEY"
+                  />
+                  <input
+                    className="env-value"
+                    value={entry.value}
+                    onChange={(e) => updateEnvEntry(index, { value: e.target.value })}
+                    placeholder="sk-..."
+                  />
+                  <button
+                    className="ghost env-action"
+                    onClick={() => removeEnvEntry(index)}
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="button-row">
+              <button className="ghost" onClick={addEnvEntry}>
+                添加一行
+              </button>
+              <button className="ghost" onClick={handleShowPaths}>
+                显示路径
+              </button>
+              <button className="primary" onClick={handleSaveEnv}>
+                保存环境变量
+              </button>
+            </div>
+            <div className="env-preview">
+              <div className="env-preview-block">
+                <div className="label">Linux / macOS (bash)</div>
+                <pre>{envPreview.linux || "# 无配置"}</pre>
+              </div>
+              <div className="env-preview-block">
+                <div className="label">Windows (PowerShell)</div>
+                <pre>{envPreview.powershell || "# 无配置"}</pre>
+              </div>
+              <div className="env-preview-block">
+                <div className="label">Windows (CMD)</div>
+                <pre>{envPreview.cmd || "REM 无配置"}</pre>
+              </div>
+            </div>
+            {runtimePaths && (
+              <div className="path-panel">
+                <div className="path-row">
+                  <div className="label">环境变量文件</div>
+                  <div className="path-value">{runtimePaths.env_file}</div>
+                </div>
+              </div>
+            )}
             {error && <div className="alert error">{error}</div>}
             {message && <div className="alert success">{message}</div>}
           </section>

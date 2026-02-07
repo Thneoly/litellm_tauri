@@ -236,6 +236,86 @@ button:active {
   overflow: hidden;
 }
 
+.env-table {
+  margin-top: 20px;
+  display: grid;
+  gap: 12px;
+}
+
+.env-header,
+.env-row {
+  display: grid;
+  grid-template-columns: 70px minmax(140px, 1fr) minmax(180px, 2fr) 100px;
+  gap: 12px;
+  align-items: center;
+}
+
+.env-header {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.env-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #7bd389;
+}
+
+.env-toggle {
+  justify-self: start;
+}
+
+.env-row button {
+  padding: 8px 12px;
+}
+
+.env-preview {
+  margin-top: 20px;
+  display: grid;
+  gap: 16px;
+}
+
+.env-preview-block {
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 14px;
+}
+
+.env-preview-block pre {
+  margin: 8px 0 0;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.path-panel {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.35);
+  display: grid;
+  gap: 12px;
+}
+
+.path-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.path-value {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  word-break: break-all;
+}
+
 .log-header {
   display: flex;
   justify-content: space-between;
@@ -268,5 +348,37 @@ button:active {
 
   .card {
     padding: 24px;
+  }
+
+  .env-header {
+    display: none;
+  }
+
+  .env-header,
+  .env-row {
+    grid-template-columns: 26px 1fr;
+    grid-template-areas:
+      "toggle key"
+      "toggle value"
+      "toggle action";
+    gap: 10px;
+  }
+
+  .env-toggle {
+    grid-area: toggle;
+    margin-top: 8px;
+  }
+
+  .env-key {
+    grid-area: key;
+  }
+
+  .env-value {
+    grid-area: value;
+  }
+
+  .env-action {
+    grid-area: action;
+    justify-self: start;
   }
 }
