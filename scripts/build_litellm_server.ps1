@@ -9,11 +9,53 @@ $cacheDir = if ($env:NUITKA_CACHE_DIR) { $env:NUITKA_CACHE_DIR } else { Join-Pat
 $outDir = if ($env:OUT_DIR) { $env:OUT_DIR } else { Join-Path $buildDir "out" }
 $litellmVersion = if ($env:LITELLM_VERSION) { $env:LITELLM_VERSION } else { "1.81.6" }
 $pythonVersion = if ($env:PYTHON_VERSION) { $env:PYTHON_VERSION } else { "3.13" }
+$sccacheDir = if ($env:SCCACHE_DIR) { $env:SCCACHE_DIR } else { Join-Path $rootDir ".cache\\sccache" }
+$sccacheSize = if ($env:SCCACHE_CACHE_SIZE) { $env:SCCACHE_CACHE_SIZE } else { "2G" }
+$forceRebuild = if ($env:FORCE_SIDECAR_REBUILD) { $env:FORCE_SIDECAR_REBUILD } else { "0" }
+$onefileCompress = if ($env:ONEFILE_COMPRESS) { $env:ONEFILE_COMPRESS } else { "0" }
+
+$targetTriple = & rustc --print host-tuple 2>$null
+if (-not $targetTriple) {
+  $hostLine = & rustc -Vv | Select-String "^host:"
+  if ($hostLine) {
+    $targetTriple = $hostLine.ToString() -replace "^host:\\s*", ""
+  }
+}
+$targetTriple = if ($targetTriple) { $targetTriple.Trim() } else { "" }
+if (-not $targetTriple) {
+  throw "Could not determine Rust target triple."
+}
+
+$sidecarPath = Join-Path $rootDir "src-tauri\\bin\\litellm_server.exe"
+$sidecarTriplePath = Join-Path $rootDir "src-tauri\\bin\\litellm_server-$targetTriple.exe"
+$sidecarMeta = Join-Path $rootDir "src-tauri\\bin\\litellm_server.meta"
 
 New-Item -ItemType Directory -Force -Path $buildDir, $cacheDir, $outDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $rootDir "src-tauri\\bin") | Out-Null
 
+$skipRebuild = $false
+if ($forceRebuild -ne "1" -and (Test-Path $sidecarPath) -and (Test-Path $sidecarTriplePath) -and (Test-Path $sidecarMeta)) {
+  $metaLines = Get-Content -Path $sidecarMeta -ErrorAction SilentlyContinue
+  $meta = @{}
+  foreach ($line in $metaLines) {
+    if ($line -match "^(?<k>[^=]+)=(?<v>.*)$") {
+      $meta[$matches.k] = $matches.v
+    }
+  }
+  if ($meta["LITELLM_VERSION"] -eq $litellmVersion -and $meta["PYTHON_VERSION"] -eq $pythonVersion -and $meta["TARGET_TRIPLE"] -eq $targetTriple -and $meta["ONEFILE_COMPRESS"] -eq $onefileCompress) {
+    Write-Host "Sidecar already built (LITELLM_VERSION=$litellmVersion, PYTHON_VERSION=$pythonVersion). Skipping."
+    exit 0
+  }
+}
+
 $pythonBin = $null
+if (Get-Command sccache -ErrorAction SilentlyContinue) {
+  New-Item -ItemType Directory -Force -Path $sccacheDir | Out-Null
+  $env:SCCACHE_DIR = $sccacheDir
+  $env:SCCACHE_CACHE_SIZE = $sccacheSize
+  $env:CC = "sccache cl.exe"
+  $env:CXX = "sccache cl.exe"
+}
 if (Get-Command uv -ErrorAction SilentlyContinue) {
   uv python install $pythonVersion
   uv venv $venvDir --python $pythonVersion
@@ -82,8 +124,10 @@ if (-not (Test-Path $swaggerDir)) {
 }
 
 $env:NUITKA_CACHE_DIR = $cacheDir
+$onefileCompressArg = if ($onefileCompress -eq "1") { "--onefile-compression" } else { "--no-onefile-compression" }
 & $pythonBin -m nuitka `
   --onefile `
+  $onefileCompressArg `
   --assume-yes-for-downloads `
   --static-libpython=no `
   --include-package=litellm `
@@ -98,19 +142,15 @@ $builtExe = Join-Path $outDir "litellm_server.exe"
 $destExe = Join-Path $rootDir "src-tauri\\bin\\litellm_server.exe"
 Copy-Item $builtExe $destExe -Force
 
-$targetTriple = & rustc --print host-tuple 2>$null
-if (-not $targetTriple) {
-  $hostLine = & rustc -Vv | Select-String "^host:"
-  if ($hostLine) {
-    $targetTriple = $hostLine.ToString() -replace "^host:\\s*", ""
-  }
-}
-$targetTriple = if ($targetTriple) { $targetTriple.Trim() } else { "" }
-if (-not $targetTriple) {
-  throw "Could not determine Rust target triple."
-}
-
 $destTripleExe = Join-Path $rootDir "src-tauri\\bin\\litellm_server-$targetTriple.exe"
 Copy-Item $destExe $destTripleExe -Force
+
+@"
+LITELLM_VERSION=$litellmVersion
+PYTHON_VERSION=$pythonVersion
+TARGET_TRIPLE=$targetTriple
+BUILD_MODE=onefile
+ONEFILE_COMPRESS=$onefileCompress
+"@ | Set-Content -Path $sidecarMeta -Encoding ASCII
 
 Write-Host "Built: $destExe"

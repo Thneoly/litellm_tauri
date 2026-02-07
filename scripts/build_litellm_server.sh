@@ -10,9 +10,35 @@ LITELLM_VERSION="${LITELLM_VERSION:-1.81.6}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.13}"
 CCACHE_DIR="${CCACHE_DIR:-$ROOT_DIR/.cache/ccache}"
 CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
+FORCE_SIDECAR_REBUILD="${FORCE_SIDECAR_REBUILD:-0}"
+ONEFILE_COMPRESS="${ONEFILE_COMPRESS:-0}"
+
+TARGET_TRIPLE="$(rustc --print host-tuple 2>/dev/null || true)"
+if [ -z "$TARGET_TRIPLE" ]; then
+  TARGET_TRIPLE="$(rustc -Vv | awk '/host:/ {print $2}')"
+fi
+if [ -z "$TARGET_TRIPLE" ]; then
+  echo "Could not determine Rust target triple."
+  exit 1
+fi
+
+SIDECAR_PATH="$ROOT_DIR/src-tauri/bin/litellm_server"
+SIDECAR_TRIPLE_PATH="$ROOT_DIR/src-tauri/bin/litellm_server-${TARGET_TRIPLE}"
+SIDECAR_META="$ROOT_DIR/src-tauri/bin/litellm_server.meta"
 
 mkdir -p "$BUILD_DIR" "$NUITKA_CACHE_DIR" "$OUT_DIR"
 mkdir -p "$ROOT_DIR/src-tauri/bin"
+
+if [ "$FORCE_SIDECAR_REBUILD" != "1" ] && [ -f "$SIDECAR_PATH" ] && [ -f "$SIDECAR_TRIPLE_PATH" ] && [ -f "$SIDECAR_META" ]; then
+  META_LITELLM_VERSION="$(awk -F= '/^LITELLM_VERSION=/{print $2}' "$SIDECAR_META" | head -n1)"
+  META_PYTHON_VERSION="$(awk -F= '/^PYTHON_VERSION=/{print $2}' "$SIDECAR_META" | head -n1)"
+  META_TARGET_TRIPLE="$(awk -F= '/^TARGET_TRIPLE=/{print $2}' "$SIDECAR_META" | head -n1)"
+  META_ONEFILE_COMPRESS="$(awk -F= '/^ONEFILE_COMPRESS=/{print $2}' "$SIDECAR_META" | head -n1)"
+  if [ "$META_LITELLM_VERSION" = "$LITELLM_VERSION" ] && [ "$META_PYTHON_VERSION" = "$PYTHON_VERSION" ] && [ "$META_TARGET_TRIPLE" = "$TARGET_TRIPLE" ] && [ "$META_ONEFILE_COMPRESS" = "$ONEFILE_COMPRESS" ]; then
+    echo "Sidecar already built (LITELLM_VERSION=$LITELLM_VERSION, PYTHON_VERSION=$PYTHON_VERSION). Skipping."
+    exit 0
+  fi
+fi
 
 PYTHON_BIN=""
 if command -v uv >/dev/null 2>&1; then
@@ -100,6 +126,7 @@ fi
 NUITKA_CACHE_DIR="$NUITKA_CACHE_DIR" \
 "$PYTHON_BIN" -m nuitka \
   --onefile \
+  $([ "$ONEFILE_COMPRESS" = "1" ] && printf "%s" "--onefile-compression" || printf "%s" "--no-onefile-compression") \
   --assume-yes-for-downloads \
   --static-libpython=no \
   --include-package=litellm \
@@ -111,15 +138,15 @@ NUITKA_CACHE_DIR="$NUITKA_CACHE_DIR" \
   "$BUILD_DIR/litellm_server.py"
 
 install -m 755 "$OUT_DIR/litellm_server" "$ROOT_DIR/src-tauri/bin/litellm_server"
-TARGET_TRIPLE="$(rustc --print host-tuple 2>/dev/null || true)"
-if [ -z "$TARGET_TRIPLE" ]; then
-  TARGET_TRIPLE="$(rustc -Vv | awk '/host:/ {print $2}')"
-fi
-if [ -z "$TARGET_TRIPLE" ]; then
-  echo "Could not determine Rust target triple."
-  exit 1
-fi
 cp -f "$ROOT_DIR/src-tauri/bin/litellm_server" \
   "$ROOT_DIR/src-tauri/bin/litellm_server-${TARGET_TRIPLE}"
 chmod +x "$ROOT_DIR/src-tauri/bin/litellm_server-${TARGET_TRIPLE}"
+
+cat > "$SIDECAR_META" <<EOF
+LITELLM_VERSION=$LITELLM_VERSION
+PYTHON_VERSION=$PYTHON_VERSION
+TARGET_TRIPLE=$TARGET_TRIPLE
+BUILD_MODE=onefile
+ONEFILE_COMPRESS=$ONEFILE_COMPRESS
+EOF
 echo "Built: $ROOT_DIR/src-tauri/bin/litellm_server"

@@ -22,6 +22,8 @@ jobs:
       NUITKA_CACHE_DIR: .cache/nuitka_cache
       CCACHE_DIR: .cache/ccache
       CCACHE_MAXSIZE: 2G
+      SCCACHE_DIR: .cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,6 +55,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ccache
 
+      - name: Install sccache (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install -y sccache
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -80,6 +88,16 @@ jobs:
           key: ${{ runner.os }}-ccache-${{ hashFiles('scripts/build_litellm_server.sh') }}
           restore-keys: |
             ${{ runner.os }}-ccache-
+
+      - name: Cache sccache
+        if: matrix.os == 'windows-latest'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/sccache
+          key: ${{ runner.os }}-sccache-${{ hashFiles('scripts/build_litellm_server.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
 
       - name: Configure Windows code signing
         if: matrix.os == 'windows-latest'
