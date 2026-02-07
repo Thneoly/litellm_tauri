@@ -73,12 +73,39 @@ fn default_env_enabled() -> bool {
     true
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct TokenSettings {
+    auth_url: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct TokenInfo {
+    token: String,
+    fetched_at: u64,
+    expires_at: Option<u64>,
+    project_id: Option<String>,
+    project_name: Option<String>,
+    project_extra: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenRequest {
+    auth_url: String,
+    employee_id: String,
+    password: String,
+    project_id: Option<String>,
+    project_name: Option<String>,
+    project_extra: Option<serde_json::Value>,
+}
+
 #[derive(Serialize)]
 struct RuntimePaths {
     app_config_dir: String,
     auth_file: String,
     config_file: String,
     env_file: String,
+    token_settings_file: String,
+    token_info_file: String,
     log_dir: String,
     log_file: String,
     resource_dir: Option<String>,
@@ -120,6 +147,14 @@ fn config_file_path(app: &AppHandle) -> Result<PathBuf> {
 
 fn env_file_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(app_config_dir(app)?.join("env.json"))
+}
+
+fn token_settings_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_config_dir(app)?.join("token_settings.json"))
+}
+
+fn token_info_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_config_dir(app)?.join("token_info.json"))
 }
 
 fn read_auth_file(app: &AppHandle) -> Result<AuthFile> {
@@ -179,6 +214,71 @@ fn apply_env_entries(cmd: &mut Command, entries: &[EnvEntry]) {
             cmd.env(&entry.key, &entry.value);
         }
     }
+}
+
+fn read_token_settings(app: &AppHandle) -> Result<TokenSettings> {
+    let path = token_settings_path(app)?;
+    if !path.exists() {
+        return Ok(TokenSettings {
+            auth_url: String::new(),
+        });
+    }
+    let raw = fs::read_to_string(&path).context("read token settings")?;
+    let settings = serde_json::from_str(&raw).context("parse token settings")?;
+    Ok(settings)
+}
+
+fn write_token_settings(app: &AppHandle, settings: TokenSettings) -> Result<()> {
+    let path = token_settings_path(app)?;
+    let raw = serde_json::to_string_pretty(&settings).context("serialize token settings")?;
+    fs::write(&path, raw).context("write token settings")?;
+    Ok(())
+}
+
+fn read_token_info(app: &AppHandle) -> Result<Option<TokenInfo>> {
+    let path = token_info_path(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).context("read token info")?;
+    let info = serde_json::from_str(&raw).context("parse token info")?;
+    Ok(Some(info))
+}
+
+fn write_token_info(app: &AppHandle, info: &TokenInfo) -> Result<()> {
+    let path = token_info_path(app)?;
+    let raw = serde_json::to_string_pretty(info).context("serialize token info")?;
+    fs::write(&path, raw).context("write token info")?;
+    Ok(())
+}
+
+fn extract_token(value: &serde_json::Value) -> Option<String> {
+    let direct = value.get("token").and_then(|v| v.as_str());
+    if let Some(token) = direct {
+        return Some(token.to_string());
+    }
+    let access = value.get("access_token").and_then(|v| v.as_str());
+    if let Some(token) = access {
+        return Some(token.to_string());
+    }
+    value
+        .get("data")
+        .and_then(|v| v.get("token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn extract_expires(value: &serde_json::Value) -> Option<u64> {
+    if let Some(ts) = value.get("expires_at").and_then(|v| v.as_u64()) {
+        return Some(ts);
+    }
+    if let Some(secs) = value.get("expires_in").and_then(|v| v.as_u64()) {
+        return Some(now_unix().saturating_add(secs));
+    }
+    value
+        .get("data")
+        .and_then(|v| v.get("expires_at"))
+        .and_then(|v| v.as_u64())
 }
 
 fn hash_password(salt: &[u8], password: &str) -> String {
@@ -384,6 +484,96 @@ fn save_env(app: AppHandle, entries: Vec<EnvEntry>) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn load_token_settings(app: AppHandle) -> Result<TokenSettings, String> {
+    read_token_settings(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_token_settings(app: AppHandle, settings: TokenSettings) -> Result<bool, String> {
+    write_token_settings(&app, settings).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn load_token_info(app: AppHandle) -> Result<Option<TokenInfo>, String> {
+    read_token_info(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn fetch_internal_token(app: AppHandle, request: TokenRequest) -> Result<TokenInfo, String> {
+    let auth_url = request.auth_url.trim();
+    if auth_url.is_empty() {
+        return Err("auth_url is required".to_string());
+    }
+    if request.employee_id.trim().is_empty() || request.password.trim().is_empty() {
+        return Err("employee_id and password are required".to_string());
+    }
+
+    let mut payload = serde_json::json!({
+        "employee_id": request.employee_id.trim(),
+        "password": request.password,
+    });
+
+    if let Some(project_id) = request.project_id.clone().filter(|s| !s.trim().is_empty()) {
+        payload["project_id"] = serde_json::Value::String(project_id);
+    }
+    if let Some(project_name) = request
+        .project_name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+    {
+        payload["project_name"] = serde_json::Value::String(project_name);
+    }
+    if let Some(extra) = request.project_extra.clone() {
+        let extra_map = extra
+            .as_object()
+            .ok_or_else(|| "project_extra must be an object".to_string())?;
+        if let Some(map) = payload.as_object_mut() {
+            for (key, val) in extra_map {
+                map.insert(key.clone(), val.clone());
+            }
+        }
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post(auth_url)
+        .json(&payload)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("auth failed: HTTP {} {}", status.as_u16(), text));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("invalid json: {e}"))?;
+    let token = extract_token(&json).ok_or_else(|| "token not found in response".to_string())?;
+    let expires_at = extract_expires(&json);
+
+    let info = TokenInfo {
+        token,
+        fetched_at: now_unix(),
+        expires_at,
+        project_id: request
+            .project_id
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+        project_name: request
+            .project_name
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+        project_extra: request.project_extra.clone(),
+    };
+    write_token_info(&app, &info).map_err(|e| e.to_string())?;
+    Ok(info)
+}
+
+#[tauri::command]
 fn start_litellm(
     app: AppHandle,
     state: tauri::State<AppState>,
@@ -563,6 +753,8 @@ fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
     let auth_file = auth_file_path(&app).map_err(|e| e.to_string())?;
     let config_file = config_file_path(&app).map_err(|e| e.to_string())?;
     let env_file = env_file_path(&app).map_err(|e| e.to_string())?;
+    let token_settings_file = token_settings_path(&app).map_err(|e| e.to_string())?;
+    let token_info_file = token_info_path(&app).map_err(|e| e.to_string())?;
     let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
     let log_file = log_dir.join("litellm.log");
 
@@ -585,6 +777,8 @@ fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
         auth_file: auth_file.to_string_lossy().to_string(),
         config_file: config_file.to_string_lossy().to_string(),
         env_file: env_file.to_string_lossy().to_string(),
+        token_settings_file: token_settings_file.to_string_lossy().to_string(),
+        token_info_file: token_info_file.to_string_lossy().to_string(),
         log_dir: log_dir.to_string_lossy().to_string(),
         log_file: log_file.to_string_lossy().to_string(),
         resource_dir,
@@ -606,6 +800,10 @@ pub fn run() {
             save_config,
             load_env,
             save_env,
+            load_token_settings,
+            save_token_settings,
+            load_token_info,
+            fetch_internal_token,
             start_litellm,
             stop_litellm,
             litellm_status,

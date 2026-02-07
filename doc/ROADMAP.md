@@ -7,6 +7,39 @@ Date: 2026-02-07
 - Minimize time-to-first-success from install to a working proxy.
 - Offer clear diagnostics and enterprise-ready controls (audit, policy, updates).
 
+## Primary Use Case (Internal Enterprise)
+- Company requires strict confidentiality; only internal LLM APIs are allowed.
+- Common CLI tools (Gemini CLI, Claude CLI, etc.) need to work by configuring `api_key` and `base_url` to route through LiteLLM.
+- Due to internal network/security restrictions, LiteLLM cannot be run directly from source.
+- Therefore, LiteLLM server must be pre-packaged as an executable and launched with one click.
+- The desktop app must include user management, config management, and environment variable management.
+- When routing to internal LLMs, users must first obtain a token with employee ID/password, then add the token and project metadata into LiteLLM `extra_body` in the config.
+
+## Target User Flow (Internal Enterprise)
+1. Install signed desktop package (Windows/Linux).
+2. First run: create local account and login.
+3. Configure environment variables (internal endpoints, proxy, secrets).
+4. Obtain internal token using employee ID/password.
+5. Generate or edit LiteLLM config with `extra_body` including token and project metadata.
+6. Start LiteLLM sidecar with one click.
+7. Verify health and logs.
+8. Configure CLI tools with `base_url` and `api_key` to route requests through LiteLLM.
+
+## Requirements (NPDP Perspective)
+- Must work without external source builds (pre-packaged sidecar only).
+- Must be usable in restricted corporate networks.
+- Must provide deterministic, low-friction setup for internal token + `extra_body`.
+- Must provide clear diagnostics for failure points.
+- Must keep secrets local and masked in UI.
+
+## Implementation Plan (Workstreams)
+- Packaging and Compliance: stable cross-platform CI builds (Windows/Linux) with bundled sidecar, plus code signing and integrity checks.
+- Token and Auth Flow: internal token retrieval UI (employee ID/password), secure storage, and auto-injection into `extra_body`.
+- Config and Template Management: official internal templates, schema validation, and inline errors.
+- Environment Management: env editor with masking, import/export, per-entry enable/disable, and runtime application.
+- Operations and Diagnostics: health checks, logs, metrics, and one-click diagnostics export.
+- UX and Onboarding: first-run wizard, template selection, and CLI tool setup guidance.
+
 ## Release Phases
 
 ### 0.0.x (MVP)
@@ -22,16 +55,17 @@ Exit Criteria:
 - First-time user can start LiteLLM within 5 minutes.
 
 ### 0.1.x (Beta)
-Scope: Improve usability, reduce failure points, and add diagnostics.
-- Guided first-run wizard (sidecar checks, config validation, sample templates).
+Scope: Integrate internal token flow and harden setup experience.
+- Token acquisition UI (employee ID/password) with secure local storage.
+- Config templates with `extra_body` auto-injection.
 - Config schema validation and inline linting.
 - Metrics panel (requests, error rate, latency, connections).
 - Logs search/filter, structured error summary.
-- Env secrets masking + copy controls.
+- Env secrets masking + import/export.
 
 Exit Criteria:
 - Error rate of first-run below 10%.
-- Support tickets/bug reports show predictable failures with clear instructions.
+- Internal token workflow works end-to-end without manual config edits.
 
 ### 1.0 (GA)
 Scope: Enterprise readiness and trust.
@@ -45,13 +79,18 @@ Exit Criteria:
 - Security review pass for local storage and update path.
 - Stable upgrade path between minor versions.
 
+## KPIs
+- Time-to-first-success (install to healthy proxy) < 5 minutes.
+- First-run failure rate < 10%.
+- Support resolution time reduced by 50% with diagnostics export.
+
 ## Key Risks
 - Sidecar build instability across OS/Python/Nuitka versions.
-- Poor first-run experience due to missing keys or config mistakes.
+- Token workflow changes by internal IAM systems.
 - CI flakiness when external dependencies change.
 
 ## Next Tactical Steps
-- Implement metrics endpoint parsing for connections/requests.
+- Add token acquisition flow UI and storage model.
+- Implement `extra_body` templating in config editor.
 - Add config schema validation in UI.
-- Add env import/export (.env) and secrets masking.
 - Improve CI logs with explicit failure hints.

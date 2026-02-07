@@ -28,6 +28,8 @@ type RuntimePaths = {
   auth_file: string;
   config_file: string;
   env_file: string;
+  token_settings_file: string;
+  token_info_file: string;
   log_dir: string;
   log_file: string;
   resource_dir?: string | null;
@@ -41,7 +43,29 @@ type EnvEntry = {
   enabled: boolean;
 };
 
-type TabKey = "config" | "status" | "env";
+type TokenSettings = {
+  auth_url: string;
+};
+
+type TokenInfo = {
+  token: string;
+  fetched_at: number;
+  expires_at?: number | null;
+  project_id?: string | null;
+  project_name?: string | null;
+  project_extra?: Record<string, unknown> | null;
+};
+
+type TokenRequest = {
+  auth_url: string;
+  employee_id: string;
+  password: string;
+  project_id?: string | null;
+  project_name?: string | null;
+  project_extra?: Record<string, unknown> | null;
+};
+
+type TabKey = "config" | "status" | "env" | "token";
 
 const sampleConfig = `# LiteLLM config example (YAML)
 # https://docs.litellm.ai/docs/proxy/configs
@@ -84,6 +108,14 @@ function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [runtimePaths, setRuntimePaths] = useState<RuntimePaths | null>(null);
   const [envEntries, setEnvEntries] = useState<EnvEntry[]>([]);
+  const [tokenSettings, setTokenSettings] = useState<TokenSettings>({ auth_url: "" });
+  const [tokenInfo, setTokenInfo] = useState<TokenInfo | null>(null);
+  const [employeeId, setEmployeeId] = useState("");
+  const [employeePassword, setEmployeePassword] = useState("");
+  const [projectId, setProjectId] = useState("");
+  const [projectName, setProjectName] = useState("");
+  const [projectExtra, setProjectExtra] = useState("");
+  const [showToken, setShowToken] = useState(false);
 
   const hasAccount = authStatus?.has_account ?? false;
   const showRegister = authStatus && !hasAccount;
@@ -131,6 +163,16 @@ function App() {
     }
   }
 
+  async function loadTokenSettings() {
+    const settings = await invoke<TokenSettings>("load_token_settings");
+    setTokenSettings(settings);
+  }
+
+  async function loadTokenInfo() {
+    const info = await invoke<TokenInfo | null>("load_token_info");
+    setTokenInfo(info ?? null);
+  }
+
   useEffect(() => {
     refreshAuth().catch((err) => setError(String(err)));
   }, []);
@@ -139,6 +181,8 @@ function App() {
     if (!loggedIn) return;
     loadConfig().catch((err) => setError(String(err)));
     loadEnv().catch((err) => setError(String(err)));
+    loadTokenSettings().catch((err) => setError(String(err)));
+    loadTokenInfo().catch((err) => setError(String(err)));
     refreshStatus().catch((err) => setError(String(err)));
     refreshHealth().catch(() => undefined);
     const timer = window.setInterval(() => {
@@ -208,6 +252,17 @@ function App() {
     }
   }
 
+  async function handleSaveTokenSettings() {
+    setError("");
+    setMessage("");
+    try {
+      await invoke("save_token_settings", { settings: tokenSettings });
+      setMessage("Token 配置已保存");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   async function handleStart() {
     setError("");
     setMessage("");
@@ -248,6 +303,46 @@ function App() {
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  async function handleFetchToken() {
+    setError("");
+    setMessage("");
+    let extra: Record<string, unknown> | null = null;
+    if (projectExtra.trim()) {
+      try {
+        const parsed = JSON.parse(projectExtra);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          setError("项目扩展 JSON 必须是对象");
+          return;
+        }
+        extra = parsed;
+      } catch (err) {
+        setError(`项目扩展 JSON 解析失败: ${String(err)}`);
+        return;
+      }
+    }
+    try {
+      const payload: TokenRequest = {
+        auth_url: tokenSettings.auth_url,
+        employee_id: employeeId,
+        password: employeePassword,
+        project_id: projectId || null,
+        project_name: projectName || null,
+        project_extra: extra,
+      };
+      const info = await invoke<TokenInfo>("fetch_internal_token", { request: payload });
+      setTokenInfo(info);
+      setEmployeePassword("");
+      setMessage("Token 获取成功");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  function maskToken(token: string) {
+    if (token.length <= 8) return "********";
+    return `${token.slice(0, 4)}...${token.slice(-4)}`;
   }
 
   function updateEnvEntry(index: number, patch: Partial<EnvEntry>) {
@@ -293,6 +388,24 @@ function App() {
     return { linux, powershell, cmd };
   }, [envEntries]);
 
+  const extraBodyPreview = useMemo(() => {
+    if (!tokenInfo) return "extra_body:\n  # token: <your token>\n";
+    const lines = ["extra_body:"];
+    lines.push(`  token: "${tokenInfo.token}"`);
+    if (tokenInfo.project_id) {
+      lines.push(`  project_id: "${tokenInfo.project_id}"`);
+    }
+    if (tokenInfo.project_name) {
+      lines.push(`  project_name: "${tokenInfo.project_name}"`);
+    }
+    if (tokenInfo.project_extra) {
+      Object.entries(tokenInfo.project_extra).forEach(([key, value]) => {
+        lines.push(`  ${key}: "${String(value)}"`);
+      });
+    }
+    return lines.join("\n");
+  }, [tokenInfo]);
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -316,6 +429,12 @@ function App() {
               onClick={() => setTab("env")}
             >
               环境变量
+            </button>
+            <button
+              className={tab === "token" ? "tab active" : "tab"}
+              onClick={() => setTab("token")}
+            >
+              Token
             </button>
             <button
               className={tab === "status" ? "tab active" : "tab"}
@@ -555,6 +674,142 @@ function App() {
                 </div>
               </div>
             )}
+            {error && <div className="alert error">{error}</div>}
+            {message && <div className="alert success">{message}</div>}
+          </section>
+        )}
+
+        {loggedIn && tab === "token" && (
+          <section className="card token-card">
+            <h2>内部 Token 获取</h2>
+            <p className="muted">
+              使用工号/密码获取内部 Token。保存配置后可重复使用。
+            </p>
+            <div className="form-grid">
+              <label>
+                Auth URL
+                <input
+                  value={tokenSettings.auth_url}
+                  onChange={(e) =>
+                    setTokenSettings({ ...tokenSettings, auth_url: e.target.value })
+                  }
+                  placeholder="https://internal-auth.example.com/token"
+                />
+              </label>
+            </div>
+            <div className="button-row">
+              <button className="ghost" onClick={handleSaveTokenSettings}>
+                保存 Auth 配置
+              </button>
+            </div>
+
+            <div className="form-grid token-form">
+              <label>
+                工号
+                <input
+                  value={employeeId}
+                  onChange={(e) => setEmployeeId(e.target.value)}
+                  placeholder="EMP00123"
+                />
+              </label>
+              <label>
+                密码
+                <input
+                  type="password"
+                  value={employeePassword}
+                  onChange={(e) => setEmployeePassword(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </label>
+              <label>
+                项目 ID
+                <input
+                  value={projectId}
+                  onChange={(e) => setProjectId(e.target.value)}
+                  placeholder="project-xyz"
+                />
+              </label>
+              <label>
+                项目名称
+                <input
+                  value={projectName}
+                  onChange={(e) => setProjectName(e.target.value)}
+                  placeholder="内部大模型项目"
+                />
+              </label>
+            </div>
+            <label>
+              项目扩展信息（JSON，可选）
+              <textarea
+                className="token-extra"
+                value={projectExtra}
+                onChange={(e) => setProjectExtra(e.target.value)}
+                placeholder='{\"department\":\"R&D\",\"scope\":\"prod\"}'
+              />
+            </label>
+            <div className="button-row">
+              <button className="primary" onClick={handleFetchToken}>
+                获取 Token
+              </button>
+              <button className="ghost" onClick={handleShowPaths}>
+                显示路径
+              </button>
+            </div>
+
+            {tokenInfo && (
+              <div className="token-panel">
+                <div className="path-row">
+                  <div className="label">Token</div>
+                  <div className="token-value">
+                    {showToken ? tokenInfo.token : maskToken(tokenInfo.token)}
+                  </div>
+                  <button className="ghost" onClick={() => setShowToken((v) => !v)}>
+                    {showToken ? "隐藏" : "显示"}
+                  </button>
+                </div>
+                <div className="path-row">
+                  <div className="label">获取时间</div>
+                  <div className="path-value">{formatTimestamp(tokenInfo.fetched_at)}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">过期时间</div>
+                  <div className="path-value">
+                    {tokenInfo.expires_at ? formatTimestamp(tokenInfo.expires_at) : "-"}
+                  </div>
+                </div>
+                <div className="path-row">
+                  <div className="label">项目 ID</div>
+                  <div className="path-value">{tokenInfo.project_id ?? "-"}</div>
+                </div>
+                <div className="path-row">
+                  <div className="label">项目名称</div>
+                  <div className="path-value">{tokenInfo.project_name ?? "-"}</div>
+                </div>
+                {runtimePaths && (
+                  <div className="path-row">
+                    <div className="label">Token 文件</div>
+                    <div className="path-value">{runtimePaths.token_info_file}</div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="env-preview">
+              <div className="env-preview-block">
+                <div className="label">LiteLLM extra_body 模板</div>
+                <pre>{extraBodyPreview}</pre>
+              </div>
+            </div>
+
+            {runtimePaths && (
+              <div className="path-panel">
+                <div className="path-row">
+                  <div className="label">Token 配置文件</div>
+                  <div className="path-value">{runtimePaths.token_settings_file}</div>
+                </div>
+              </div>
+            )}
+
             {error && <div className="alert error">{error}</div>}
             {message && <div className="alert success">{message}</div>}
           </section>
