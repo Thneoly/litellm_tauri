@@ -90,6 +90,7 @@ fi
 NUITKA_CACHE_DIR="$NUITKA_CACHE_DIR" \
 "$PYTHON_BIN" -m nuitka \
   --onefile \
+  --assume-yes-for-downloads \
   --static-libpython=no \
   --include-package=litellm \
   --include-package=litellm.litellm_core_utils \

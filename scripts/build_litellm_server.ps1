@@ -84,6 +84,7 @@ if (-not (Test-Path $swaggerDir)) {
 $env:NUITKA_CACHE_DIR = $cacheDir
 & $pythonBin -m nuitka `
   --onefile `
+  --assume-yes-for-downloads `
   --static-libpython=no `
   --include-package=litellm `
   --include-package=litellm.litellm_core_utils `
