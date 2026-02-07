@@ -4,7 +4,7 @@
 
 ## 启动
 ```bash
-node scripts/mock_token_server.js
+node scripts/mock_token_server.cjs
 ```
 
 默认地址：
