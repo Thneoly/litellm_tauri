@@ -339,6 +339,9 @@ fn find_sidecar(app: &AppHandle) -> Result<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            if let Some(path) = try_bin_dir(dir.to_path_buf())? {
+                return Ok(path);
+            }
             if let Some(path) = try_bin_dir(dir.join("bin"))? {
                 return Ok(path);
             }
