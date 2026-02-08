@@ -124,19 +124,21 @@ if (-not (Test-Path $swaggerDir)) {
 }
 
 $env:NUITKA_CACHE_DIR = $cacheDir
-$onefileCompressArg = if ($onefileCompress -eq "1") { "--onefile-compression" } else { "--no-onefile-compression" }
-& $pythonBin -m nuitka `
-  --onefile `
-  $onefileCompressArg `
-  --assume-yes-for-downloads `
-  --static-libpython=no `
-  --include-package=litellm `
-  --include-package=litellm.litellm_core_utils `
-  "--include-data-files=$endpointsJson=litellm/containers/endpoints.json" `
-  "--include-data-dir=$swaggerDir=litellm/proxy/swagger" `
-  --output-filename=litellm_server `
-  --output-dir=$outDir `
-  $serverPath
+$nuitkaArgs = @(
+  "--onefile",
+  "--assume-yes-for-downloads",
+  "--static-libpython=no",
+  "--include-package=litellm",
+  "--include-package=litellm.litellm_core_utils",
+  "--include-data-files=$endpointsJson=litellm/containers/endpoints.json",
+  "--include-data-dir=$swaggerDir=litellm/proxy/swagger",
+  "--output-filename=litellm_server",
+  "--output-dir=$outDir"
+)
+if ($onefileCompress -eq "1") {
+  $nuitkaArgs += "--onefile-compression"
+}
+& $pythonBin -m nuitka @nuitkaArgs $serverPath
 
 $builtExe = Join-Path $outDir "litellm_server.exe"
 $destExe = Join-Path $rootDir "src-tauri\\bin\\litellm_server.exe"

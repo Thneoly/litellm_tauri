@@ -126,7 +126,7 @@ fi
 NUITKA_CACHE_DIR="$NUITKA_CACHE_DIR" \
 "$PYTHON_BIN" -m nuitka \
   --onefile \
-  $([ "$ONEFILE_COMPRESS" = "1" ] && printf "%s" "--onefile-compression" || printf "%s" "--no-onefile-compression") \
+  $( [ "$ONEFILE_COMPRESS" = "1" ] && printf "%s" "--onefile-compression" ) \
   --assume-yes-for-downloads \
   --static-libpython=no \
   --include-package=litellm \
