@@ -65,8 +65,11 @@ if command -v ccache >/dev/null 2>&1; then
   mkdir -p "$CCACHE_DIR"
   export CCACHE_DIR
   export CCACHE_MAXSIZE
-  export CC="ccache gcc"
-  export CXX="ccache g++"
+  if [ -d /usr/lib/ccache ]; then
+    export PATH="/usr/lib/ccache:$PATH"
+  fi
+  export CC="gcc"
+  export CXX="g++"
 fi
 
 cat > "$BUILD_DIR/litellm_server.py" <<'PY'
