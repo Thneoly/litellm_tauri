@@ -43,6 +43,10 @@ type EnvEntry = {
   enabled: boolean;
 };
 
+type AppSettings = {
+  health_interval_seconds: number;
+};
+
 type TokenSettings = {
   auth_url: string;
 };
@@ -66,6 +70,8 @@ type TokenRequest = {
 };
 
 type TabKey = "config" | "status" | "env" | "token";
+
+const ENABLE_TOKEN_PAGE = false;
 
 const sampleConfig = `# LiteLLM config example (YAML)
 # https://docs.litellm.ai/docs/proxy/configs
@@ -108,6 +114,7 @@ function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [runtimePaths, setRuntimePaths] = useState<RuntimePaths | null>(null);
   const [envEntries, setEnvEntries] = useState<EnvEntry[]>([]);
+  const [healthIntervalSec, setHealthIntervalSec] = useState("3");
   const [tokenSettings, setTokenSettings] = useState<TokenSettings>({ auth_url: "" });
   const [tokenInfo, setTokenInfo] = useState<TokenInfo | null>(null);
   const [employeeId, setEmployeeId] = useState("");
@@ -163,6 +170,12 @@ function App() {
     }
   }
 
+  async function loadAppSettings() {
+    const settings = await invoke<AppSettings>("load_app_settings");
+    const secs = settings.health_interval_seconds || 3;
+    setHealthIntervalSec(String(secs));
+  }
+
   async function loadTokenSettings() {
     const settings = await invoke<TokenSettings>("load_token_settings");
     setTokenSettings(settings);
@@ -181,16 +194,33 @@ function App() {
     if (!loggedIn) return;
     loadConfig().catch((err) => setError(String(err)));
     loadEnv().catch((err) => setError(String(err)));
-    loadTokenSettings().catch((err) => setError(String(err)));
-    loadTokenInfo().catch((err) => setError(String(err)));
+    loadAppSettings().catch((err) => setError(String(err)));
+    if (ENABLE_TOKEN_PAGE) {
+      loadTokenSettings().catch((err) => setError(String(err)));
+      loadTokenInfo().catch((err) => setError(String(err)));
+    }
     refreshStatus().catch((err) => setError(String(err)));
-    refreshHealth().catch(() => undefined);
     const timer = window.setInterval(() => {
       refreshStatus().catch(() => undefined);
-      refreshHealth().catch(() => undefined);
     }, 3000);
     return () => window.clearInterval(timer);
   }, [loggedIn]);
+
+  useEffect(() => {
+    if (!loggedIn) return;
+    refreshHealth().catch(() => undefined);
+    const interval = Math.max(1, Number(healthIntervalSec) || 3) * 1000;
+    const timer = window.setInterval(() => {
+      refreshHealth().catch(() => undefined);
+    }, interval);
+    return () => window.clearInterval(timer);
+  }, [loggedIn, healthIntervalSec]);
+
+  useEffect(() => {
+    if (!ENABLE_TOKEN_PAGE && tab === "token") {
+      setTab("config");
+    }
+  }, [tab]);
 
   async function handleRegister() {
     setError("");
@@ -247,6 +277,19 @@ function App() {
     try {
       await invoke("save_env", { entries: envEntries });
       setMessage("环境变量已保存");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function handleSaveAppSettings() {
+    setError("");
+    setMessage("");
+    const secs = Math.max(1, Number(healthIntervalSec) || 3);
+    try {
+      await invoke("save_app_settings", { settings: { health_interval_seconds: secs } });
+      setHealthIntervalSec(String(secs));
+      setMessage("健康检查间隔已保存");
     } catch (err) {
       setError(String(err));
     }
@@ -430,12 +473,14 @@ function App() {
             >
               环境变量
             </button>
-            <button
-              className={tab === "token" ? "tab active" : "tab"}
-              onClick={() => setTab("token")}
-            >
-              Token
-            </button>
+            {ENABLE_TOKEN_PAGE && (
+              <button
+                className={tab === "token" ? "tab active" : "tab"}
+                onClick={() => setTab("token")}
+              >
+                Token
+              </button>
+            )}
             <button
               className={tab === "status" ? "tab active" : "tab"}
               onClick={() => setTab("status")}
@@ -679,7 +724,7 @@ function App() {
           </section>
         )}
 
-        {loggedIn && tab === "token" && (
+        {ENABLE_TOKEN_PAGE && loggedIn && tab === "token" && (
           <section className="card token-card">
             <h2>内部 Token 获取</h2>
             <p className="muted">
@@ -851,6 +896,22 @@ function App() {
                 <div className="label">启动时间</div>
                 <div className="value">{formatTimestamp(status.started_at)}</div>
               </div>
+            </div>
+            <div className="form-grid">
+              <label>
+                健康检查间隔（秒）
+                <input
+                  type="number"
+                  min={1}
+                  value={healthIntervalSec}
+                  onChange={(e) => setHealthIntervalSec(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="button-row">
+              <button className="ghost" onClick={handleSaveAppSettings}>
+                保存健康检查间隔
+              </button>
             </div>
             <div className="button-row">
               <button className="ghost" onClick={refreshStatus}>

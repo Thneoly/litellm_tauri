@@ -7,6 +7,7 @@ yarn-debug.log*
 pnpm-debug.log*
 *.tsbuildinfo
 .cache/
+release_assets/
 
 # Tauri / Rust
 src-tauri/target/

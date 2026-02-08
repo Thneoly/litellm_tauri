@@ -98,6 +98,11 @@ struct TokenRequest {
     project_extra: Option<serde_json::Value>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct AppSettings {
+    health_interval_seconds: u64,
+}
+
 #[derive(Serialize)]
 struct RuntimePaths {
     app_config_dir: String,
@@ -155,6 +160,16 @@ fn token_settings_path(app: &AppHandle) -> Result<PathBuf> {
 
 fn token_info_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(app_config_dir(app)?.join("token_info.json"))
+}
+
+fn app_settings_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_config_dir(app)?.join("app_settings.json"))
+}
+
+fn default_app_settings() -> AppSettings {
+    AppSettings {
+        health_interval_seconds: 3,
+    }
 }
 
 fn read_auth_file(app: &AppHandle) -> Result<AuthFile> {
@@ -232,6 +247,23 @@ fn write_token_settings(app: &AppHandle, settings: TokenSettings) -> Result<()> 
     let path = token_settings_path(app)?;
     let raw = serde_json::to_string_pretty(&settings).context("serialize token settings")?;
     fs::write(&path, raw).context("write token settings")?;
+    Ok(())
+}
+
+fn read_app_settings(app: &AppHandle) -> Result<AppSettings> {
+    let path = app_settings_path(app)?;
+    if !path.exists() {
+        return Ok(default_app_settings());
+    }
+    let raw = fs::read_to_string(&path).context("read app settings")?;
+    let settings = serde_json::from_str(&raw).context("parse app settings")?;
+    Ok(settings)
+}
+
+fn write_app_settings(app: &AppHandle, settings: AppSettings) -> Result<()> {
+    let path = app_settings_path(app)?;
+    let raw = serde_json::to_string_pretty(&settings).context("serialize app settings")?;
+    fs::write(&path, raw).context("write app settings")?;
     Ok(())
 }
 
@@ -483,6 +515,21 @@ fn load_env(app: AppHandle) -> Result<Vec<EnvEntry>, String> {
 #[tauri::command]
 fn save_env(app: AppHandle, entries: Vec<EnvEntry>) -> Result<bool, String> {
     write_env_entries(&app, entries).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn load_app_settings(app: AppHandle) -> Result<AppSettings, String> {
+    read_app_settings(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_app_settings(app: AppHandle, settings: AppSettings) -> Result<bool, String> {
+    let mut next = settings;
+    if next.health_interval_seconds == 0 {
+        next = default_app_settings();
+    }
+    write_app_settings(&app, next).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -803,6 +850,8 @@ pub fn run() {
             save_config,
             load_env,
             save_env,
+            load_app_settings,
+            save_app_settings,
             load_token_settings,
             save_token_settings,
             load_token_info,
