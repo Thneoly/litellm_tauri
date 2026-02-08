@@ -765,6 +765,12 @@ fn start_litellm(
     cmd.arg(&host);
     cmd.arg("--config");
     cmd.arg(config_path.clone());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
