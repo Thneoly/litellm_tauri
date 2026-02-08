@@ -1,4 +1,4 @@
-# LiteLLM Desktop Roadmap
+# LiteLLM Bridge Roadmap
 
 Date: 2026-02-07
 

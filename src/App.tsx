@@ -260,6 +260,16 @@ function App() {
     }
   }
 
+  function handleAuthKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (showRegister) {
+      handleRegister();
+    } else {
+      handleLogin();
+    }
+  }
+
   async function handleSaveConfig() {
     setError("");
     setMessage("");
@@ -455,8 +465,8 @@ function App() {
         <div className="brand">
           <div className="brand-mark">LL</div>
           <div>
-            <div className="brand-title">LiteLLM Desktop</div>
-            <div className="brand-subtitle">本地封装 · Windows / Linux</div>
+            <div className="brand-title">LiteLLM Bridge</div>
+            <div className="brand-subtitle">内部中转 · Windows / Linux</div>
           </div>
         </div>
         {loggedIn && (
@@ -507,6 +517,7 @@ function App() {
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="例如：admin"
+                  onKeyDown={handleAuthKeyDown}
                 />
               </label>
               <label>
@@ -516,6 +527,7 @@ function App() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
+                  onKeyDown={handleAuthKeyDown}
                 />
               </label>
               {showRegister && (
@@ -526,6 +538,7 @@ function App() {
                     value={confirm}
                     onChange={(e) => setConfirm(e.target.value)}
                     placeholder="••••••••"
+                    onKeyDown={handleAuthKeyDown}
                   />
                 </label>
               )}

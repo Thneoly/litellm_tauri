@@ -7,10 +7,11 @@ use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
@@ -28,6 +29,10 @@ struct ProcessState {
 struct AppState {
     process: Mutex<ProcessState>,
 }
+
+const LOG_FILE_NAME: &str = "litellm.log";
+const MAX_LOG_BYTES: u64 = 300 * 1024 * 1024;
+const LOG_HISTORY: usize = 3;
 
 #[derive(Serialize, Deserialize)]
 struct AuthFile {
@@ -122,6 +127,13 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
         .unwrap_or(0)
 }
 
@@ -390,15 +402,98 @@ fn find_sidecar(app: &AppHandle) -> Result<PathBuf> {
     ))
 }
 
-fn open_log_file(path: &Path) -> Result<(Stdio, Stdio)> {
+struct LogState {
+    log_dir: PathBuf,
+    file: File,
+    size: u64,
+}
+
+fn log_file_path(log_dir: &Path, index: usize) -> PathBuf {
+    if index == 0 {
+        log_dir.join(LOG_FILE_NAME)
+    } else {
+        log_dir.join(format!("{LOG_FILE_NAME}.{index}"))
+    }
+}
+
+fn rotate_logs(log_dir: &Path) -> Result<()> {
+    let oldest = log_file_path(log_dir, LOG_HISTORY);
+    if oldest.exists() {
+        fs::remove_file(&oldest).context("remove oldest log")?;
+    }
+
+    for idx in (1..LOG_HISTORY).rev() {
+        let src = log_file_path(log_dir, idx);
+        let dst = log_file_path(log_dir, idx + 1);
+        if src.exists() {
+            fs::rename(&src, &dst).context("rotate log")?;
+        }
+    }
+
+    let current = log_file_path(log_dir, 0);
+    if current.exists() {
+        fs::rename(&current, log_file_path(log_dir, 1)).context("rotate current log")?;
+    }
+    Ok(())
+}
+
+fn open_log_state(log_dir: &Path) -> Result<LogState> {
+    let path = log_file_path(log_dir, 0);
     let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .context("open log file")?;
-    let stdout = Stdio::from(file.try_clone().context("clone log file")?);
-    let stderr = Stdio::from(file);
-    Ok((stdout, stderr))
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    Ok(LogState {
+        log_dir: log_dir.to_path_buf(),
+        file,
+        size,
+    })
+}
+
+fn rotate_log_state(state: &mut LogState) -> Result<()> {
+    state.file.flush().context("flush log file")?;
+    rotate_logs(&state.log_dir)?;
+    let path = log_file_path(&state.log_dir, 0);
+    state.file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .context("open rotated log file")?;
+    state.size = 0;
+    Ok(())
+}
+
+fn write_log_line(state: &mut LogState, line: &str) -> Result<()> {
+    state
+        .file
+        .write_all(line.as_bytes())
+        .context("write log line")?;
+    state.file.write_all(b"\n").context("write log newline")?;
+    state.size = state.size.saturating_add((line.len() + 1) as u64);
+    if state.size >= MAX_LOG_BYTES {
+        rotate_log_state(state)?;
+    }
+    Ok(())
+}
+
+fn format_log_line(kind: &str, line: &str) -> String {
+    format!("[{}] [{}] {}", now_millis(), kind, line)
+}
+
+fn spawn_log_thread(kind: &'static str, stream: impl Read + Send + 'static, state: Arc<Mutex<LogState>>) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                let formatted = format_log_line(kind, &line);
+                if let Ok(mut guard) = state.lock() {
+                    let _ = write_log_line(&mut guard, &formatted);
+                }
+            }
+        }
+    });
 }
 
 fn normalize_config(content: &str) -> String {
@@ -648,12 +743,11 @@ fn start_litellm(
     }
 
     let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
-    let log_path = log_dir.join("litellm.log");
+    rotate_logs(&log_dir).map_err(|e| e.to_string())?;
+    let log_path = log_file_path(&log_dir, 0);
 
     let sidecar = find_sidecar(&app).map_err(|e| e.to_string())?;
     let env_entries = read_env_entries(&app).map_err(|e| e.to_string())?;
-
-    let (stdout, stderr) = open_log_file(&log_path).map_err(|e| e.to_string())?;
 
     let host = host
         .and_then(|h| if h.trim().is_empty() { None } else { Some(h) })
@@ -671,11 +765,21 @@ fn start_litellm(
     cmd.arg(&host);
     cmd.arg("--config");
     cmd.arg(config_path.clone());
-    cmd.stdout(stdout);
-    cmd.stderr(stderr);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
-    let child = cmd.spawn().map_err(|e| format!("start litellm: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("start litellm: {e}"))?;
     let pid = child.id();
+
+    let log_state = Arc::new(Mutex::new(
+        open_log_state(&log_dir).map_err(|e| e.to_string())?,
+    ));
+    if let Some(stdout) = child.stdout.take() {
+        spawn_log_thread("stdout", stdout, log_state.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_log_thread("stderr", stderr, log_state.clone());
+    }
 
     process.child = Some(child);
     process.started_at = Some(now_unix());
@@ -778,7 +882,7 @@ fn litellm_health(app: AppHandle, state: tauri::State<AppState>) -> Result<Healt
 #[tauri::command]
 fn read_logs(app: AppHandle, max_lines: Option<usize>) -> Result<Vec<String>, String> {
     let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
-    let log_path = log_dir.join("litellm.log");
+    let log_path = log_file_path(&log_dir, 0);
     if !log_path.exists() {
         return Ok(vec![]);
     }
@@ -806,7 +910,7 @@ fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
     let token_settings_file = token_settings_path(&app).map_err(|e| e.to_string())?;
     let token_info_file = token_info_path(&app).map_err(|e| e.to_string())?;
     let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
-    let log_file = log_dir.join("litellm.log");
+    let log_file = log_file_path(&log_dir, 0);
 
     let resource_dir = app
         .path()
