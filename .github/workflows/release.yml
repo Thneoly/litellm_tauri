@@ -15,10 +15,15 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
+            python: '3.13'
+            build_dir: .cache/litellm_build_py313
           - os: windows-latest
+            python: '3.12'
+            build_dir: .cache/litellm_build_py312
     runs-on: ${{ matrix.os }}
     env:
-      BUILD_DIR: .cache/litellm_build_py313
+      BUILD_DIR: ${{ matrix.build_dir }}
+      PYTHON_VERSION: ${{ matrix.python }}
       NUITKA_CACHE_DIR: .cache/nuitka_cache
       CCACHE_DIR: .cache/ccache
       CCACHE_MAXSIZE: 2G
@@ -64,7 +69,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: |
             scripts/build_litellm_server.sh
@@ -75,9 +80,9 @@ jobs:
         with:
           path: |
             .cache/nuitka_cache
-          key: ${{ runner.os }}-nuitka-${{ hashFiles('scripts/build_litellm_server.sh', 'scripts/build_litellm_server.ps1') }}
+          key: ${{ runner.os }}-nuitka-${{ matrix.python }}-${{ hashFiles('scripts/build_litellm_server.sh', 'scripts/build_litellm_server.ps1') }}
           restore-keys: |
-            ${{ runner.os }}-nuitka-
+            ${{ runner.os }}-nuitka-${{ matrix.python }}-
 
       - name: Cache ccache
         if: matrix.os == 'ubuntu-22.04'
