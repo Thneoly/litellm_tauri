@@ -83,7 +83,7 @@ body {
   flex: 1;
   display: flex;
   justify-content: center;
-  padding: 32px;
+  padding: 20px 32px;
 }
 
 .card {
@@ -91,7 +91,7 @@ body {
   background: rgba(20, 24, 20, 0.8);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 18px;
-  padding: 32px;
+  padding: 24px;
   box-shadow: 0 30px 60px rgba(0, 0, 0, 0.35);
 }
 
@@ -138,7 +138,7 @@ textarea:focus {
 
 textarea {
   width: 100%;
-  min-height: 280px;
+  min-height: 220px;
   resize: vertical;
   font-family: "JetBrains Mono", "Fira Code", monospace;
 }
@@ -196,6 +196,12 @@ button:active {
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 18px;
   margin: 20px 0;
+}
+
+.status-grid .value {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .label {
@@ -359,7 +365,7 @@ button:active {
 .log-body {
   margin: 0;
   padding: 16px;
-  max-height: 260px;
+  max-height: 200px;
   overflow: auto;
   font-family: "JetBrains Mono", "Fira Code", monospace;
   font-size: 12px;

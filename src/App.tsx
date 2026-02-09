@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type AuthStatus = {
@@ -41,6 +43,20 @@ type EnvEntry = {
   key: string;
   value: string;
   enabled: boolean;
+};
+
+type LogEvent = {
+  line: string;
+};
+
+type LogFileInfo = {
+  name: string;
+  bytes: number;
+};
+
+type LogStats = {
+  max_bytes: number;
+  files: LogFileInfo[];
 };
 
 type AppSettings = {
@@ -95,6 +111,18 @@ function formatTimestamp(ts?: number | null) {
   }
 }
 
+function formatBytes(value?: number | null) {
+  if (!value || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let idx = 0;
+  let size = value;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
 function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loggedIn, setLoggedIn] = useState(false);
@@ -114,6 +142,7 @@ function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [runtimePaths, setRuntimePaths] = useState<RuntimePaths | null>(null);
   const [envEntries, setEnvEntries] = useState<EnvEntry[]>([]);
+  const [logStats, setLogStats] = useState<LogStats | null>(null);
   const [healthIntervalSec, setHealthIntervalSec] = useState("3");
   const [tokenSettings, setTokenSettings] = useState<TokenSettings>({ auth_url: "" });
   const [tokenInfo, setTokenInfo] = useState<TokenInfo | null>(null);
@@ -123,6 +152,9 @@ function App() {
   const [projectName, setProjectName] = useState("");
   const [projectExtra, setProjectExtra] = useState("");
   const [showToken, setShowToken] = useState(false);
+  const healthInFlight = useRef(false);
+
+  const MAX_LOG_LINES = 500;
 
   const hasAccount = authStatus?.has_account ?? false;
   const showRegister = authStatus && !hasAccount;
@@ -147,13 +179,27 @@ function App() {
   async function refreshStatus() {
     const next = await invoke<RunStatus>("litellm_status");
     setStatus(next);
+  }
+
+  async function refreshHealth() {
+    if (healthInFlight.current) return;
+    healthInFlight.current = true;
+    try {
+      const next = await invoke<HealthStatus>("litellm_health");
+      setHealth(next);
+    } finally {
+      healthInFlight.current = false;
+    }
+  }
+
+  async function loadLogs() {
     const nextLogs = await invoke<string[]>("read_logs", { max_lines: 200 });
     setLogs(nextLogs);
   }
 
-  async function refreshHealth() {
-    const next = await invoke<HealthStatus>("litellm_health");
-    setHealth(next);
+  async function loadLogStats() {
+    const stats = await invoke<LogStats>("log_stats");
+    setLogStats(stats);
   }
 
   async function loadConfig() {
@@ -200,21 +246,86 @@ function App() {
       loadTokenInfo().catch((err) => setError(String(err)));
     }
     refreshStatus().catch((err) => setError(String(err)));
-    const timer = window.setInterval(() => {
-      refreshStatus().catch(() => undefined);
-    }, 3000);
-    return () => window.clearInterval(timer);
   }, [loggedIn]);
 
   useEffect(() => {
     if (!loggedIn) return;
+    if (tab !== "status") return;
+    let statusTimer: number | null = null;
+    let healthTimer: number | null = null;
+
+    const startTimers = () => {
+      if (statusTimer == null) {
+        statusTimer = window.setInterval(() => {
+          if (document.hidden) return;
+          refreshStatus().catch(() => undefined);
+          loadLogStats().catch(() => undefined);
+        }, 3000);
+      }
+      if (healthTimer == null) {
+        const interval = Math.max(1, Number(healthIntervalSec) || 3) * 1000;
+        healthTimer = window.setInterval(() => {
+          if (document.hidden) return;
+          refreshHealth().catch(() => undefined);
+        }, interval);
+      }
+    };
+
+    const stopTimers = () => {
+      if (statusTimer != null) {
+        window.clearInterval(statusTimer);
+        statusTimer = null;
+      }
+      if (healthTimer != null) {
+        window.clearInterval(healthTimer);
+        healthTimer = null;
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        stopTimers();
+      } else {
+        refreshStatus().catch(() => undefined);
+        refreshHealth().catch(() => undefined);
+        startTimers();
+      }
+    };
+
+    refreshStatus().catch(() => undefined);
     refreshHealth().catch(() => undefined);
-    const interval = Math.max(1, Number(healthIntervalSec) || 3) * 1000;
-    const timer = window.setInterval(() => {
-      refreshHealth().catch(() => undefined);
-    }, interval);
-    return () => window.clearInterval(timer);
-  }, [loggedIn, healthIntervalSec]);
+    loadLogs().catch(() => undefined);
+    loadLogStats().catch(() => undefined);
+    startTimers();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stopTimers();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [loggedIn, tab, healthIntervalSec]);
+
+  useEffect(() => {
+    if (!loggedIn) return;
+    let unlisten: (() => void) | undefined;
+    listen<LogEvent>("litellm_log", (event) => {
+      const line = event.payload?.line;
+      if (!line) return;
+      setLogs((prev) => {
+        const next = [...prev, line];
+        if (next.length > MAX_LOG_LINES) {
+          return next.slice(next.length - MAX_LOG_LINES);
+        }
+        return next;
+      });
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => undefined);
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [loggedIn]);
 
   useEffect(() => {
     if (!ENABLE_TOKEN_PAGE && tab === "token") {
@@ -316,7 +427,29 @@ function App() {
     }
   }
 
-  async function handleStart() {
+  async function handleClearLogs() {
+    setError("");
+    setMessage("");
+    try {
+      await invoke("clear_logs");
+      await loadLogs();
+      await loadLogStats();
+      setMessage("日志已清空");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function handleOpenLogDir() {
+    if (!runtimePaths?.log_dir) return;
+    try {
+      await openPath(runtimePaths.log_dir);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function handleStart(debugEnv = false) {
     setError("");
     setMessage("");
     const parsedPort = Number(port);
@@ -325,9 +458,12 @@ function App() {
       const next = await invoke<RunStatus>("start_litellm", {
         port: usePort,
         host,
+        debug_env: debugEnv,
       });
       setStatus(next);
       setTab("status");
+      loadLogs().catch(() => undefined);
+      loadLogStats().catch(() => undefined);
       setMessage("LiteLLM 已启动");
     } catch (err) {
       setError(String(err));
@@ -599,6 +735,9 @@ function App() {
               </label>
               <button className="primary" onClick={handleStart}>
                 启动 LiteLLM
+              </button>
+              <button className="ghost" onClick={() => handleStart(true)}>
+                Debug 启动
               </button>
             </div>
             <div className="button-row">
@@ -930,6 +1069,12 @@ function App() {
               <button className="ghost" onClick={refreshStatus}>
                 刷新状态
               </button>
+              <button className="ghost" onClick={handleClearLogs}>
+                清空日志
+              </button>
+              <button className="ghost" onClick={handleOpenLogDir}>
+                打开日志目录
+              </button>
               <button className="primary" onClick={handleStop}>
                 停止 LiteLLM
               </button>
@@ -937,7 +1082,13 @@ function App() {
             <div className="log-panel">
               <div className="log-header">
                 <span>日志输出</span>
-                <span className="muted">{status.log_path ?? "-"}</span>
+                <span className="muted">
+                  {logStats
+                    ? `${formatBytes(logStats.files.find((f) => f.name === "litellm.log")?.bytes)} / ${formatBytes(
+                        logStats.max_bytes,
+                      )}`
+                    : status.log_path ?? "-"}
+                </span>
               </div>
               <pre className="log-body">{logs.length ? logs.join("\n") : "暂无日志"}</pre>
             </div>

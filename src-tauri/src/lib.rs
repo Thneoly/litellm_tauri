@@ -1,20 +1,23 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 use anyhow::{anyhow, Context, Result};
-use rand::RngCore;
+use argon2::PasswordHash;
+use argon2::PasswordHasher;
+use argon2::PasswordVerifier;
+use argon2::password_hash::SaltString;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 #[derive(Default)]
 struct ProcessState {
@@ -23,23 +26,48 @@ struct ProcessState {
     port: Option<u16>,
     host: Option<String>,
     log_path: Option<PathBuf>,
+    log_state: Option<Arc<Mutex<LogState>>>,
+    debug_env: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
 struct AppState {
-    process: Mutex<ProcessState>,
+    process: Arc<Mutex<ProcessState>>,
+    health_client: reqwest::Client,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            process: Arc::new(Mutex::new(ProcessState::default())),
+            health_client: client,
+        }
+    }
 }
 
 const LOG_FILE_NAME: &str = "litellm.log";
-const MAX_LOG_BYTES: u64 = 300 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 100 * 1024 * 1024;
 const LOG_HISTORY: usize = 3;
+const LOG_EVENT_NAME: &str = "litellm_log";
 
 #[derive(Serialize, Deserialize)]
 struct AuthFile {
     username: String,
-    salt_hex: String,
-    password_hash_hex: String,
+    #[serde(default)]
+    salt_hex: Option<String>,
+    #[serde(default)]
+    password_hash_hex: Option<String>,
+    #[serde(default)]
+    password_hash: String,
     created_at: u64,
+    #[serde(default)]
+    failed_attempts: u32,
+    #[serde(default)]
+    locked_until: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -108,6 +136,11 @@ struct AppSettings {
     health_interval_seconds: u64,
 }
 
+#[derive(Serialize, Clone)]
+struct LogEvent {
+    line: String,
+}
+
 #[derive(Serialize)]
 struct RuntimePaths {
     app_config_dir: String,
@@ -123,6 +156,17 @@ struct RuntimePaths {
     sidecar_path: Option<String>,
 }
 
+#[derive(Serialize)]
+struct LogFileInfo {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct LogStats {
+    max_bytes: u64,
+    files: Vec<LogFileInfo>,
+}
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -152,6 +196,10 @@ fn app_log_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn pid_file_path(app: &AppHandle) -> Result<PathBuf> {
+    Ok(app_config_dir(app)?.join("litellm.pid"))
+}
+
 fn auth_file_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(app_config_dir(app)?.join("auth.json"))
 }
@@ -172,6 +220,72 @@ fn token_settings_path(app: &AppHandle) -> Result<PathBuf> {
 
 fn token_info_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(app_config_dir(app)?.join("token_info.json"))
+}
+
+fn write_pid_file(app: &AppHandle, pid: u32) -> Result<()> {
+    let path = pid_file_path(app)?;
+    fs::write(&path, pid.to_string()).context("write pid file")?;
+    Ok(())
+}
+
+fn clear_pid_file(app: &AppHandle) -> Result<()> {
+    let path = pid_file_path(app)?;
+    if path.exists() {
+        fs::remove_file(&path).context("remove pid file")?;
+    }
+    Ok(())
+}
+
+fn read_pid_file(app: &AppHandle) -> Result<Option<u32>> {
+    let path = pid_file_path(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).context("read pid file")?;
+    let pid: u32 = raw.trim().parse().context("parse pid")?;
+    Ok(Some(pid))
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+fn process_matches_sidecar(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let text = String::from_utf8_lossy(&cmdline);
+        return text.contains("litellm_server");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        return true;
+    }
+}
+
+fn cleanup_orphan_sidecar(app: &AppHandle) {
+    let pid = match read_pid_file(app) {
+        Ok(Some(pid)) => pid,
+        _ => return,
+    };
+
+    if process_matches_sidecar(pid) {
+        kill_pid(pid);
+    }
+    let _ = clear_pid_file(app);
 }
 
 fn app_settings_path(app: &AppHandle) -> Result<PathBuf> {
@@ -332,6 +446,21 @@ fn hash_password(salt: &[u8], password: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn hash_password_argon2(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    let argon2 = argon2::Argon2::default();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow!(e))?;
+    Ok(hash.to_string())
+}
+
+fn verify_password_argon2(hash: &str, password: &str) -> Result<bool> {
+    let parsed = PasswordHash::new(hash).map_err(|e| anyhow!(e))?;
+    let argon2 = argon2::Argon2::default();
+    Ok(argon2.verify_password(password.as_bytes(), &parsed).is_ok())
+}
+
 fn find_sidecar(app: &AppHandle) -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LITELLM_SIDECAR_PATH") {
         let path = PathBuf::from(path);
@@ -482,7 +611,12 @@ fn format_log_line(kind: &str, line: &str) -> String {
     format!("[{}] [{}] {}", now_millis(), kind, line)
 }
 
-fn spawn_log_thread(kind: &'static str, stream: impl Read + Send + 'static, state: Arc<Mutex<LogState>>) {
+fn spawn_log_thread(
+    kind: &'static str,
+    stream: impl Read + Send + 'static,
+    state: Arc<Mutex<LogState>>,
+    app: AppHandle,
+) {
     thread::spawn(move || {
         let reader = BufReader::new(stream);
         for line in reader.lines() {
@@ -491,9 +625,48 @@ fn spawn_log_thread(kind: &'static str, stream: impl Read + Send + 'static, stat
                 if let Ok(mut guard) = state.lock() {
                     let _ = write_log_line(&mut guard, &formatted);
                 }
+                let _ = app.emit(LOG_EVENT_NAME, LogEvent { line: formatted });
             }
         }
     });
+}
+
+fn tail_lines(path: &Path, max_lines: usize) -> Result<Vec<String>> {
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = File::open(path).context("open log file")?;
+    let mut pos = file.seek(SeekFrom::End(0)).context("seek log")?;
+    if pos == 0 {
+        return Ok(Vec::new());
+    }
+
+    const CHUNK: usize = 64 * 1024;
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut newline_count = 0usize;
+
+    while pos > 0 && newline_count <= max_lines {
+        let read_size = std::cmp::min(CHUNK as u64, pos) as usize;
+        pos -= read_size as u64;
+        file.seek(SeekFrom::Start(pos)).context("seek log chunk")?;
+        let mut buf = vec![0u8; read_size];
+        file.read_exact(&mut buf).context("read log chunk")?;
+        newline_count += buf.iter().filter(|b| **b == b'\n').count();
+        chunks.push(buf);
+    }
+
+    chunks.reverse();
+    let mut data = Vec::new();
+    for chunk in chunks {
+        data.extend_from_slice(&chunk);
+    }
+
+    let text = String::from_utf8_lossy(&data);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    Ok(lines)
 }
 
 fn normalize_config(content: &str) -> String {
@@ -551,14 +724,16 @@ fn auth_register(app: AppHandle, username: String, password: String) -> Result<A
         return Err("username and password are required".to_string());
     }
 
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
+    let hash = hash_password_argon2(&password).map_err(|e| e.to_string())?;
 
     let auth = AuthFile {
         username: username.trim().to_string(),
-        salt_hex: hex::encode(salt),
-        password_hash_hex: hash_password(&salt, &password),
+        salt_hex: None,
+        password_hash_hex: None,
+        password_hash: hash,
         created_at: now_unix(),
+        failed_attempts: 0,
+        locked_until: None,
     };
 
     write_auth_file(&app, &auth).map_err(|e| e.to_string())?;
@@ -575,11 +750,46 @@ fn auth_login(app: AppHandle, username: String, password: String) -> Result<bool
     if auth.username != username.trim() {
         return Err("invalid username or password".to_string());
     }
-    let salt = hex::decode(auth.salt_hex).map_err(|_| "corrupt auth file")?;
-    let candidate = hash_password(&salt, &password);
-    if candidate != auth.password_hash_hex {
+    let now = now_unix();
+    if let Some(locked_until) = auth.locked_until {
+        if locked_until > now {
+            return Err(format!("account locked until {locked_until}"));
+        }
+    }
+
+    let mut next = auth;
+
+    let mut verified = false;
+    if !next.password_hash.trim().is_empty() {
+        verified = verify_password_argon2(&next.password_hash, &password)
+            .map_err(|e| e.to_string())?;
+    } else if let (Some(salt_hex), Some(hash_hex)) =
+        (next.salt_hex.as_ref(), next.password_hash_hex.as_ref())
+    {
+        let salt = hex::decode(salt_hex).map_err(|_| "corrupt auth file")?;
+        let candidate = hash_password(&salt, &password);
+        verified = candidate == *hash_hex;
+        if verified {
+            if let Ok(new_hash) = hash_password_argon2(&password) {
+                next.password_hash = new_hash;
+                next.salt_hex = None;
+                next.password_hash_hex = None;
+            }
+        }
+    }
+
+    if !verified {
+        next.failed_attempts = next.failed_attempts.saturating_add(1);
+        if next.failed_attempts >= 5 {
+            next.locked_until = Some(now.saturating_add(60));
+        }
+        write_auth_file(&app, &next).map_err(|e| e.to_string())?;
         return Err("invalid username or password".to_string());
     }
+
+    next.failed_attempts = 0;
+    next.locked_until = None;
+    write_auth_file(&app, &next).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -608,9 +818,36 @@ fn load_env(app: AppHandle) -> Result<Vec<EnvEntry>, String> {
 }
 
 #[tauri::command]
-fn save_env(app: AppHandle, entries: Vec<EnvEntry>) -> Result<bool, String> {
+fn save_env(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    entries: Vec<EnvEntry>,
+) -> Result<bool, String> {
+    let previous = read_env_entries(&app).map_err(|e| e.to_string())?;
     write_env_entries(&app, entries).map_err(|e| e.to_string())?;
-    Ok(true)
+
+    let mut process = state.process.lock().map_err(|_| "process lock poisoned")?;
+    let was_running = process.child.is_some();
+    let port = process.port;
+    let host = process.host.clone();
+    let debug_env = process.debug_env;
+
+    if !was_running {
+        return Ok(true);
+    }
+
+    stop_child(&app, &mut process);
+    match spawn_litellm(&app, &mut process, port, host.clone(), debug_env) {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            // rollback to previous env settings
+            let _ = write_env_entries(&app, previous);
+            if was_running {
+                let _ = spawn_litellm(&app, &mut process, port, host, debug_env);
+            }
+            Err(format!("env applied but restart failed; rolled back: {err}"))
+        }
+    }
 }
 
 #[tauri::command]
@@ -718,15 +955,29 @@ fn fetch_internal_token(app: AppHandle, request: TokenRequest) -> Result<TokenIn
     Ok(info)
 }
 
-#[tauri::command]
-fn start_litellm(
-    app: AppHandle,
-    state: tauri::State<AppState>,
+fn stop_child(app: &AppHandle, process: &mut ProcessState) -> bool {
+    if let Some(mut child) = process.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        process.started_at = None;
+        process.port = None;
+        process.host = None;
+        process.log_path = None;
+        process.log_state = None;
+        process.debug_env = false;
+        let _ = clear_pid_file(app);
+        return true;
+    }
+    false
+}
+
+fn spawn_litellm(
+    app: &AppHandle,
+    process: &mut ProcessState,
     port: Option<u16>,
     host: Option<String>,
+    debug_env: bool,
 ) -> Result<RunStatus, String> {
-    let mut process = state.process.lock().map_err(|_| "process lock poisoned")?;
-
     if let Some(child) = &mut process.child {
         if let Ok(Some(_)) = child.try_wait() {
             process.child = None;
@@ -737,17 +988,17 @@ fn start_litellm(
         return Err("litellm already running".to_string());
     }
 
-    let config_path = config_file_path(&app).map_err(|e| e.to_string())?;
+    let config_path = config_file_path(app).map_err(|e| e.to_string())?;
     if !config_path.exists() {
         return Err("config.yaml not found; save config first".to_string());
     }
 
-    let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
+    let log_dir = app_log_dir(app).map_err(|e| e.to_string())?;
     rotate_logs(&log_dir).map_err(|e| e.to_string())?;
     let log_path = log_file_path(&log_dir, 0);
 
-    let sidecar = find_sidecar(&app).map_err(|e| e.to_string())?;
-    let env_entries = read_env_entries(&app).map_err(|e| e.to_string())?;
+    let sidecar = find_sidecar(app).map_err(|e| e.to_string())?;
+    let env_entries = read_env_entries(app).map_err(|e| e.to_string())?;
 
     let host = host
         .and_then(|h| if h.trim().is_empty() { None } else { Some(h) })
@@ -756,6 +1007,9 @@ fn start_litellm(
     let mut cmd = Command::new(&sidecar);
     apply_env_entries(&mut cmd, &env_entries);
     cmd.env("LITELLM_CONFIG_PATH", &config_path);
+    if debug_env {
+        cmd.env("LITELLM_DEBUG_ENV", "1");
+    }
     if let Some(port) = port {
         cmd.env("LITELLM_PORT", port.to_string());
         cmd.arg("--port");
@@ -776,15 +1030,16 @@ fn start_litellm(
 
     let mut child = cmd.spawn().map_err(|e| format!("start litellm: {e}"))?;
     let pid = child.id();
+    let _ = write_pid_file(app, pid);
 
     let log_state = Arc::new(Mutex::new(
         open_log_state(&log_dir).map_err(|e| e.to_string())?,
     ));
     if let Some(stdout) = child.stdout.take() {
-        spawn_log_thread("stdout", stdout, log_state.clone());
+        spawn_log_thread("stdout", stdout, log_state.clone(), app.clone());
     }
     if let Some(stderr) = child.stderr.take() {
-        spawn_log_thread("stderr", stderr, log_state.clone());
+        spawn_log_thread("stderr", stderr, log_state.clone(), app.clone());
     }
 
     process.child = Some(child);
@@ -792,6 +1047,8 @@ fn start_litellm(
     process.port = port;
     process.host = Some(host.clone());
     process.log_path = Some(log_path.clone());
+    process.log_state = Some(log_state.clone());
+    process.debug_env = debug_env;
 
     Ok(RunStatus {
         running: true,
@@ -805,65 +1062,94 @@ fn start_litellm(
 }
 
 #[tauri::command]
-fn stop_litellm(state: tauri::State<AppState>) -> Result<bool, String> {
-    let mut process = state.process.lock().map_err(|_| "process lock poisoned")?;
-    if let Some(mut child) = process.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-#[tauri::command]
-fn litellm_status(state: tauri::State<AppState>) -> Result<RunStatus, String> {
-    let mut process = state.process.lock().map_err(|_| "process lock poisoned")?;
-
-    if let Some(child) = &mut process.child {
-        if let Ok(Some(_)) = child.try_wait() {
-            process.child = None;
-        }
-    }
-
-    Ok(RunStatus {
-        running: process.child.is_some(),
-        pid: process.child.as_ref().map(|c| c.id()),
-        started_at: process.started_at,
-        port: process.port,
-        host: process.host.clone(),
-        connections: None,
-        log_path: process
-            .log_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
+async fn start_litellm(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    port: Option<u16>,
+    host: Option<String>,
+    debug_env: Option<bool>,
+) -> Result<RunStatus, String> {
+    let app = app.clone();
+    let process = state.process.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut process = process.lock().map_err(|_| "process lock poisoned")?;
+        spawn_litellm(&app, &mut process, port, host, debug_env.unwrap_or(false))
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn litellm_health(app: AppHandle, state: tauri::State<AppState>) -> Result<HealthStatus, String> {
-    let process = state.process.lock().map_err(|_| "process lock poisoned")?;
-    let host = process
-        .host
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = match process.port {
-        Some(port) => port,
-        None => {
-            return Ok(HealthStatus {
-                ok: false,
-                status: None,
-                error: Some("port not set".to_string()),
-            })
+async fn stop_litellm(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let process = state.process.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut process = process.lock().map_err(|_| "process lock poisoned")?;
+        Ok(stop_child(&app, &mut process))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn litellm_status(state: tauri::State<'_, AppState>) -> Result<RunStatus, String> {
+    let process = state.process.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut process = process.lock().map_err(|_| "process lock poisoned")?;
+
+        if let Some(child) = &mut process.child {
+            if let Ok(Some(_)) = child.try_wait() {
+                process.child = None;
+            }
         }
+
+        Ok(RunStatus {
+            running: process.child.is_some(),
+            pid: process.child.as_ref().map(|c| c.id()),
+            started_at: process.started_at,
+            port: process.port,
+            host: process.host.clone(),
+            connections: None,
+            log_path: process
+                .log_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn litellm_health(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<HealthStatus, String> {
+    let (host, port, master_key) = {
+        let process = state.process.lock().map_err(|_| "process lock poisoned")?;
+        let host = process
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = match process.port {
+            Some(port) => port,
+            None => {
+                return Ok(HealthStatus {
+                    ok: false,
+                    status: None,
+                    error: Some("port not set".to_string()),
+                })
+            }
+        };
+        let master_key = read_master_key(&app);
+        (host, port, master_key)
     };
 
     let url = format!("http://{host}:{port}/health");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-    // Try to read master_key from config if present, to avoid 401 on /health.
-    let master_key = read_master_key(&app);
+    let client = state.health_client.clone();
 
     let mut req = client.get(url);
     if let Some(key) = master_key {
@@ -871,7 +1157,7 @@ fn litellm_health(app: AppHandle, state: tauri::State<AppState>) -> Result<Healt
         req = req.header("Authorization", bearer).header("x-api-key", key);
     }
 
-    match req.send() {
+    match req.send().await {
         Ok(resp) => Ok(HealthStatus {
             ok: resp.status().is_success(),
             status: Some(resp.status().as_u16()),
@@ -886,25 +1172,77 @@ fn litellm_health(app: AppHandle, state: tauri::State<AppState>) -> Result<Healt
 }
 
 #[tauri::command]
-fn read_logs(app: AppHandle, max_lines: Option<usize>) -> Result<Vec<String>, String> {
-    let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
-    let log_path = log_file_path(&log_dir, 0);
-    if !log_path.exists() {
-        return Ok(vec![]);
-    }
+async fn read_logs(app: AppHandle, max_lines: Option<usize>) -> Result<Vec<String>, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
+        let log_path = log_file_path(&log_dir, 0);
+        if !log_path.exists() {
+            return Ok(vec![]);
+        }
+        let limit = max_lines.unwrap_or(200);
+        tail_lines(&log_path, limit).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
-    let file = File::open(&log_path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader
-        .lines()
-        .filter_map(|line| line.ok())
-        .collect();
+#[tauri::command]
+async fn log_stats(app: AppHandle) -> Result<LogStats, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
+        let mut files = Vec::new();
+        for idx in 0..=LOG_HISTORY {
+            let path = log_file_path(&log_dir, idx);
+            if let Ok(meta) = fs::metadata(&path) {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("log")
+                    .to_string();
+                files.push(LogFileInfo {
+                    name,
+                    bytes: meta.len(),
+                });
+            }
+        }
+        Ok(LogStats {
+            max_bytes: MAX_LOG_BYTES,
+            files,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
-    let limit = max_lines.unwrap_or(200);
-    if lines.len() <= limit {
-        return Ok(lines);
-    }
-    Ok(lines[lines.len() - limit..].to_vec())
+#[tauri::command]
+async fn clear_logs(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<bool, String> {
+    let process = state.process.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(guard) = process.lock() {
+            if let Some(state) = guard.log_state.as_ref() {
+                if let Ok(mut log_state) = state.lock() {
+                    rotate_log_state(&mut log_state).map_err(|e| e.to_string())?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        let log_dir = app_log_dir(&app).map_err(|e| e.to_string())?;
+        for idx in 0..=LOG_HISTORY {
+            let path = log_file_path(&log_dir, idx);
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file_path(&log_dir, 0));
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -949,9 +1287,21 @@ fn runtime_paths(app: AppHandle) -> Result<RuntimePaths, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            cleanup_orphan_sidecar(&app.handle());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let process = window.app_handle().state::<AppState>().process.clone();
+                if let Ok(mut guard) = process.lock() {
+                    stop_child(&window.app_handle(), &mut guard);
+                };
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             auth_status,
             auth_register,
@@ -960,6 +1310,8 @@ pub fn run() {
             save_config,
             load_env,
             save_env,
+            log_stats,
+            clear_logs,
             load_app_settings,
             save_app_settings,
             load_token_settings,
@@ -973,6 +1325,15 @@ pub fn run() {
             read_logs,
             runtime_paths
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+            let process = app_handle.state::<AppState>().process.clone();
+            if let Ok(mut guard) = process.lock() {
+                stop_child(app_handle, &mut guard);
+            };
+        }
+    });
 }

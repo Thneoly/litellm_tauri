@@ -91,6 +91,15 @@ def _inject_arg(args: List[str], flag: str, value: str) -> None:
     if value and not _has_flag(args, flag):
         args.extend([flag, value])
 
+def _print_env_if_debug() -> None:
+    if os.environ.get("LITELLM_DEBUG_ENV") != "1":
+        return
+    print("=== LiteLLM Env Dump (debug) ===")
+    for key in sorted(os.environ.keys()):
+        print(f"{key}={os.environ.get(key)}")
+    print("=== End Env Dump ===")
+    sys.stdout.flush()
+
 
 def main() -> None:
     args = list(sys.argv[1:])
@@ -102,6 +111,7 @@ def main() -> None:
     if port:
         _inject_arg(args, "--port", port)
 
+    _print_env_if_debug()
     proxy_cli.run_server.main(args=args, prog_name="litellm_server")
 
 
