@@ -18,6 +18,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Default)]
 struct ProcessState {
@@ -28,6 +30,7 @@ struct ProcessState {
     log_path: Option<PathBuf>,
     log_state: Option<Arc<Mutex<LogState>>>,
     debug_env: bool,
+    pgid: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -255,10 +258,8 @@ fn kill_pid(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg(pid.to_string())
-            .status();
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     }
 }
 
@@ -957,7 +958,22 @@ fn fetch_internal_token(app: AppHandle, request: TokenRequest) -> Result<TokenIn
 
 fn stop_child(app: &AppHandle, process: &mut ProcessState) -> bool {
     if let Some(mut child) = process.child.take() {
-        let _ = child.kill();
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .status();
+        }
+        #[cfg(unix)]
+        {
+            if let Some(pgid) = process.pgid {
+                let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            } else {
+                let _ = child.kill();
+            }
+        }
         let _ = child.wait();
         process.started_at = None;
         process.port = None;
@@ -965,6 +981,7 @@ fn stop_child(app: &AppHandle, process: &mut ProcessState) -> bool {
         process.log_path = None;
         process.log_state = None;
         process.debug_env = false;
+        process.pgid = None;
         let _ = clear_pid_file(app);
         return true;
     }
@@ -1019,11 +1036,23 @@ fn spawn_litellm(
     cmd.arg(&host);
     cmd.arg("--config");
     cmd.arg(config_path.clone());
+    if sidecar_supports_no_fork(&sidecar) {
+        cmd.arg("--no-fork");
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1035,6 +1064,11 @@ fn spawn_litellm(
     let log_state = Arc::new(Mutex::new(
         open_log_state(&log_dir).map_err(|e| e.to_string())?,
     ));
+    let starting_line = format_log_line("system", "litellm_server starting...");
+    if let Ok(mut guard) = log_state.lock() {
+        let _ = write_log_line(&mut guard, &starting_line);
+    }
+    let _ = app.emit(LOG_EVENT_NAME, LogEvent { line: starting_line });
     if let Some(stdout) = child.stdout.take() {
         spawn_log_thread("stdout", stdout, log_state.clone(), app.clone());
     }
@@ -1049,6 +1083,7 @@ fn spawn_litellm(
     process.log_path = Some(log_path.clone());
     process.log_state = Some(log_state.clone());
     process.debug_env = debug_env;
+    process.pgid = Some(pid as i32);
 
     Ok(RunStatus {
         running: true,
@@ -1059,6 +1094,18 @@ fn spawn_litellm(
         connections: None,
         log_path: Some(log_path.to_string_lossy().to_string()),
     })
+}
+
+fn sidecar_supports_no_fork(sidecar: &Path) -> bool {
+    let output = Command::new(sidecar).arg("--help").output();
+    let output = match output {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text.contains("--no-fork")
 }
 
 #[tauri::command]

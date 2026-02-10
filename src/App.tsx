@@ -155,6 +155,7 @@ function App() {
   const healthInFlight = useRef(false);
 
   const MAX_LOG_LINES = 500;
+  const [healthGraceUntil, setHealthGraceUntil] = useState<number | null>(null);
 
   const hasAccount = authStatus?.has_account ?? false;
   const showRegister = authStatus && !hasAccount;
@@ -166,6 +167,7 @@ function App() {
 
   const healthLabel = useMemo(() => {
     if (!health) return "-";
+    if (health.error === "starting") return "启动中";
     if (health.ok) return "OK";
     if (health.status) return `HTTP ${health.status}`;
     return "FAIL";
@@ -183,6 +185,10 @@ function App() {
 
   async function refreshHealth() {
     if (healthInFlight.current) return;
+    if (healthGraceUntil && Date.now() < healthGraceUntil) {
+      setHealth({ ok: false, status: null, error: "starting" });
+      return;
+    }
     healthInFlight.current = true;
     try {
       const next = await invoke<HealthStatus>("litellm_health");
@@ -464,6 +470,7 @@ function App() {
       setTab("status");
       loadLogs().catch(() => undefined);
       loadLogStats().catch(() => undefined);
+      setHealthGraceUntil(Date.now() + 8000);
       setMessage("LiteLLM 已启动");
     } catch (err) {
       setError(String(err));
@@ -733,7 +740,7 @@ function App() {
                   placeholder="4000"
                 />
               </label>
-              <button className="primary" onClick={handleStart}>
+              <button className="primary" onClick={() => handleStart(false)}>
                 启动 LiteLLM
               </button>
               <button className="ghost" onClick={() => handleStart(true)}>
@@ -1085,8 +1092,8 @@ function App() {
                 <span className="muted">
                   {logStats
                     ? `${formatBytes(logStats.files.find((f) => f.name === "litellm.log")?.bytes)} / ${formatBytes(
-                        logStats.max_bytes,
-                      )}`
+                      logStats.max_bytes,
+                    )}`
                     : status.log_path ?? "-"}
                 </span>
               </div>
